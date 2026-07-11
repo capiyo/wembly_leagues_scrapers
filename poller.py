@@ -1,7 +1,15 @@
 """
-Live poller for World Cup matches with smart state management.
+Live poller for league matches with smart state management.
 Handles: upcoming → soon → live → completed → archived
+
+NOTE: World Cup scraping has been removed from the automatic loop.
+_trigger_rescrape() now calls leagues_scraper.scrape_all_leagues_window(),
+a rolling config.SCRAPE_DAYS_AHEAD-day window across every league in
+config.LEAGUES, instead of scraper.scrape_world_cup_fixtures(). This
+covers both the reactive trigger (fired right after a match is archived)
+and the twice-daily scheduled backstop below.
 """
+
 from __future__ import annotations
 
 import logging
@@ -16,7 +24,8 @@ from dotenv import load_dotenv
 from forwarder import Forwarder
 from mongo_store import FixtureStore
 from sources import threesixtyfive
-import scraper
+import config
+import leagues_scraper
 
 load_dotenv()
 
@@ -74,13 +83,16 @@ class MatchStateMachine:
             minutes_until_kickoff = float("inf")
 
         status = match.get("status", "")
+
         if status == "completed":
             return "completed"
 
         if minutes_until_kickoff <= 0:
             return "live"
+
         if minutes_until_kickoff <= SOON_THRESHOLD_MINUTES:
             return "soon"
+
         return "upcoming"
 
     def should_update_status(self, match: Dict[str, Any]) -> Optional[str]:
@@ -188,7 +200,7 @@ class Poller:
     # trigger in _trigger_rescrape (called right after a match is archived)
     # -- it exists purely to cover cases where a match never cleanly
     # finalizes (stuck state, crashed poll cycle, etc.) and the reactive
-    # path never fires, so `fixtures` could otherwise silently starve.
+    # path never fires, so `games` could otherwise silently starve.
     # Deliberately NOT a cron job / separate Render service -- this is a
     # plain elapsed-time check inside the existing poll loop, so the
     # scraper still only actually runs once or twice a day, using the
@@ -203,7 +215,7 @@ class Poller:
         self.poll_count = 0
         # Seeded to "already due" so the very first poll cycle after startup
         # also performs a scrape -- covers the case where the service was
-        # just deployed/restarted and `fixtures` is empty.
+        # just deployed/restarted and `games` is empty.
         self.last_scheduled_scrape = datetime.now(timezone.utc) - self.SCHEDULED_RESCRAPE_INTERVAL
 
     def start(self):
@@ -215,6 +227,7 @@ class Poller:
                 self.poll_once()
             except Exception as e:
                 logger.error(f"Poll cycle failed: {e}", exc_info=True)
+
             self.poll_count += 1
             time.sleep(3)
 
@@ -233,7 +246,6 @@ class Poller:
         self._maybe_scheduled_rescrape()
 
         all_fixtures = self.store.get_all_fixtures()
-
         if not all_fixtures:
             logger.debug("No fixtures found")
             return
@@ -273,11 +285,11 @@ class Poller:
         game = details.get("game", {})
         status_group = game.get("statusGroup")
         status_text = game.get("statusText", "")
-
         home_score = game.get("homeCompetitor", {}).get("score")
         away_score = game.get("awayCompetitor", {}).get("score")
+
         has_real_score = (
-            home_score is not None and away_score is not None and 
+            home_score is not None and away_score is not None and
             home_score >= 0 and away_score >= 0
         )
 
@@ -388,6 +400,7 @@ class Poller:
                 if new_status == "completed":
                     self._finalize_match_result(match)
                     return
+
                 if new_status == "live":
                     self._notify_match_live(match)
 
@@ -431,9 +444,9 @@ class Poller:
             return
 
         already_forwarded = self.store.get_forwarded_event_signatures(match_id)
-
         new_entries = []
         new_signatures = []
+
         for entry in commentary:
             sig = f"commentary:{entry.get('minute', 0)}:{entry.get('text', '')[:80]}"
             if sig in already_forwarded:
@@ -453,7 +466,7 @@ class Poller:
         # zombie fixture documents (partial docs with an auto-generated
         # ObjectId _id) whenever commentary kept arriving for a match that
         # had already been archived to games_history and deleted from
-        # `fixtures`. forward_commentary_bulk above already persists this
+        # `games`. forward_commentary_bulk above already persists this
         # correctly via the Rust API, which safely no-ops (DocumentNotFound)
         # instead of upserting when the fixture is gone.
         self.store.add_forwarded_event_signatures_bulk(match_id, new_signatures)
@@ -495,6 +508,7 @@ class Poller:
                     "home": self._team_lineup_for_forwarder(lineups.get("home", {})),
                     "away": self._team_lineup_for_forwarder(lineups.get("away", {})),
                 }
+
                 lineups_payload = {
                     "fixture_id": match_id,
                     "home_team": home_team,
@@ -540,9 +554,7 @@ class Poller:
         if stats:
             minute = int(stats.get("minute", 0) or 0)
             team_stats = {"home": stats.get("home", {}), "away": stats.get("away", {})}
-
             self.store.add_statistics_snapshot(match_id, team_stats, minute)
-
             self.forwarder.forward_statistics({
                 "fixture_id": match_id,
                 "minute": minute,
@@ -553,35 +565,32 @@ class Poller:
     def _settle_and_complete_match(self, match: Dict[str, Any], game: Dict[str, Any]):
         """Settle bets, mark completed, and move to history."""
         match_id = match.get("matchId")
-        
         home_comp = game.get("homeCompetitor", {})
         away_comp = game.get("awayCompetitor", {})
-        
         home_score = home_comp.get("score")
         away_score = away_comp.get("score")
-        
+
         if home_score is None or away_score is None:
             logger.warning(f"⚠️ Missing scores for {match_id}, cannot settle")
             return
-        
+
         if home_score > away_score:
             result = "home"
         elif away_score > home_score:
             result = "away"
         else:
             result = "draw"
-        
+
         logger.info(f"💰 Settling bets for {match_id}: {result} ({home_score}-{away_score})")
-        
+
         settle_success = self.forwarder.settle_bets(match_id, result)
-        
+
         if settle_success:
             logger.info(f"✅ Bets settled for {match_id}")
             self.state_machine.mark_settlement_success(match_id)
-            
             self.store.update_score(match_id, home_score, away_score)
             self.store.update_status(match_id, "completed")
-            
+
             history_success = self.forwarder.move_to_history(match_id)
             if history_success:
                 logger.info(f"📦 {match_id} moved to history")
@@ -618,15 +627,13 @@ class Poller:
         game = details.get("game", {})
         status_group = game.get("statusGroup")
         status_text = game.get("statusText", "")
-
         home_comp = game.get("homeCompetitor", {})
         away_comp = game.get("awayCompetitor", {})
-
         home_score = home_comp.get("score")
         away_score = away_comp.get("score")
 
         has_real_score = (
-            home_score is not None and away_score is not None and 
+            home_score is not None and away_score is not None and
             home_score >= 0 and away_score >= 0
         )
 
@@ -635,6 +642,7 @@ class Poller:
             logger.info(f"📊 {match_id}: Score updated {home_score}-{away_score}")
 
         phase = threesixtyfive.classify_match_phase(status_text)
+
         if self.state_machine.should_forward_statistics(match_id, phase):
             logger.info(f"📊 {match_id}: phase={phase} ({status_text!r}) - fetching statistics")
             self._fetch_and_forward_statistics(match, game=game)
@@ -643,19 +651,19 @@ class Poller:
         # ─── MATCH END DETECTION ──────────────────────────────────────────────
         if phase == "fulltime" or status_group == STATUS_GROUP_FINISHED:
             logger.info(f"🏁 {match_id}: Match ended")
-            
+
             # Check if already settled
             if match_id in self.state_machine.completed_notified:
                 logger.info(f"⏭️ {match_id} already completed and notified")
                 return
-            
+
             # Check if we should retry settlement
             if not self.state_machine.should_retry_settlement(match_id):
                 logger.warning(f"⚠️ {match_id}: Max settlement retries reached, forcing completion")
                 self.store.update_status(match_id, "completed")
                 self._finalize_match_result(match)
                 return
-            
+
             # Settle bets and complete match
             self._settle_and_complete_match(match, game)
             return
@@ -673,19 +681,33 @@ class Poller:
         self.forwarder.forward_live_update(live_update)
 
     def _trigger_rescrape(self, reason: str = ""):
-        """Immediately re-run fixture discovery so a freshly-archived slot
-        in `fixtures` gets refilled with upcoming matches right away,
-        instead of waiting for the next scheduled /scrape trigger.
+        """Re-run league fixture discovery so a freshly-archived slot in
+        `games` gets refilled with upcoming league matches right away,
+        instead of waiting for the next scheduled backstop.
+
+        Leagues-only, rolling window: calls
+        leagues_scraper.scrape_all_leagues_window(), which upserts only
+        fixtures kicking off within config.SCRAPE_DAYS_AHEAD days (7 by
+        default) for every league in config.LEAGUES. A league whose
+        season hasn't started yet simply upserts nothing until its first
+        fixture falls inside that window -- no separate "has the season
+        started" check is needed.
+
+        World Cup scraping (scraper.scrape_world_cup_fixtures) has been
+        removed from this path entirely.
 
         Runs synchronously in the poll loop -- a slow 365Scores response
         here will delay polling of other live matches for that cycle. If
         that becomes a problem in practice (e.g. several matches finishing
-        around the same time during a busy tournament window), move the
-        body of this into a daemon thread instead of calling it inline."""
+        around the same time across leagues), move the body of this into
+        a daemon thread instead of calling it inline."""
         try:
-            logger.info(f"🔄 Triggering rescrape ({reason})...")
-            new_count = scraper.scrape_world_cup_fixtures(self.store)
-            logger.info(f"✅ Rescrape complete: {new_count} fixtures upserted")
+            logger.info(f"🔄 Triggering league rescrape ({reason})...")
+            results = leagues_scraper.scrape_all_leagues_window(
+                self.store, days_ahead=config.SCRAPE_DAYS_AHEAD
+            )
+            total = sum(results.values())
+            logger.info(f"✅ Rescrape complete: {results} (total={total} fixtures upserted)")
         except Exception as e:
             logger.error(f"❌ Rescrape failed: {e}")
 
@@ -708,6 +730,7 @@ class Poller:
             result = "draw"
 
         success = self.forwarder.move_to_history(match_id)
+
         if success:
             self.state_machine.mark_completed_notified(match_id)
             logger.info(f"🏁 Match {match_id} finalized: {result} ({home_score}-{away_score})")
@@ -730,6 +753,7 @@ class Poller:
                 "type": "match_live",
             },
         }
+
         self.forwarder.forward_notification(notification)
         logger.info(f"🔴 {match_id}: Match is now LIVE!")
 
