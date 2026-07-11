@@ -17,46 +17,20 @@ logger = logging.getLogger(__name__)
 def home():
     return jsonify({
         "status": "running",
-        "service": "World Cup Poller",
+        "service": "Clash League Fixture Scraper",
         "endpoints": {
-            "/scrape": "Trigger the World Cup scraper to fetch fixtures",
             "/scrape/leagues": "Trigger the multi-league scraper (?league=epl|seriea|ucl|europa|facup|community_shield|all, default all)",
             "/scrape/epl-round": "Fetch only one round of EPL fixtures (?round=N to pin a round, default auto-detects next round)",
             "/health": "Health check"
-        }
+        },
+        "note": "The old World Cup-only /scrape endpoint was removed -- leagues_scraper.py "
+                "(via poller.py's automatic rolling 7-day window) is now the sole scrape path. "
+                "Use /scrape/leagues?league=all for a manual full-catalog run."
     })
 
 @app.route('/health')
 def health():
     return jsonify({"status": "healthy"})
-
-@app.route('/scrape')
-def trigger_scraper():
-    """Run the scraper in the background."""
-    def run_scraper():
-        try:
-            logger.info("📋 Scraper triggered via /scrape endpoint")
-            process = subprocess.Popen(
-                [sys.executable, 'scraper.py'],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1
-            )
-            for line in process.stdout:
-                logger.info(f"📤 {line.strip()}")
-            process.wait()
-            logger.info(f"✅ Scraper finished with code: {process.returncode}")
-        except Exception as e:
-            logger.error(f"❌ Scraper failed: {e}")
-
-    thread = threading.Thread(target=run_scraper)
-    thread.start()
-    return jsonify({
-        "status": "started",
-        "message": "Scraper triggered in background",
-        "endpoint": "/scrape"
-    })
 
 
 @app.route('/scrape/leagues')

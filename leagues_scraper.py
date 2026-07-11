@@ -1,16 +1,20 @@
 """
-League-based fixture scraper.
+League-based fixture scraper. THE single scraper module for this service --
+the old World Cup-only scraper.py has been removed; everything (manual
+full/round scrapes and the automatic rolling-window scrape) lives here now.
 
 Generates fixtures for multiple competitions -- Premier League, Serie A,
 UEFA Champions League, UEFA Europa League, FA Cup, Community Shield --
-from 365Scores and stores them all in the SAME MongoDB collection as the
-World Cup poller: config.MONGO_COLLECTION, which now defaults to "games"
-(renamed from "fixtures").
+from 365Scores and stores them all in config.MONGO_COLLECTION (defaults
+to "games").
 
-This module deliberately mirrors scraper.py's shape (same
-_status_to_internal / _parse_kickoff helpers, same FixtureStore.upsert_fixture
-call) so the two scrapers stay consistent and both feed poller.py /
-forwarder.py without any changes on that side.
+poller.py's _trigger_rescrape() calls scrape_all_leagues_window() below
+(a rolling config.SCRAPE_DAYS_AHEAD-day window, 7 by default) -- both on
+the reactive trigger fired right after a match is archived/finalized, and
+on the twice-daily scheduled backstop. The full-season and single-round
+functions (scrape_league_fixtures / scrape_one_round) are kept for
+manual/CLI use -- e.g. seeding a brand-new league for the first time --
+but the poller itself only ever calls the *_window variants.
 
 Usage:
     # Scrape every configured league, full fixture list each:
@@ -27,6 +31,12 @@ Usage:
     # Same, but pin to a specific round number instead of "whichever
     # round is next":
     python leagues_scraper.py --league epl --round-only --round-num 1
+
+    # Rolling window (what the poller runs automatically) -- only writes
+    # fixtures that kick off within the next N days, so a league whose
+    # season hasn't started yet simply upserts nothing:
+    python leagues_scraper.py --league epl --window
+    python leagues_scraper.py --league all --window --days-ahead 7
 """
 from __future__ import annotations
 
@@ -217,6 +227,90 @@ def scrape_one_round(store: FixtureStore, league_key: str, round_num: Optional[i
     return _upsert_games(store, round_games, league_key)
 
 
+# ============================================================
+# ROLLING WINDOW SCRAPE (used automatically by poller.py)
+# ============================================================
+
+def scrape_league_fixtures_window(store: FixtureStore, league_key: str, days_ahead: int = 7) -> int:
+    """Fetch a league's fixtures and upsert only the ones landing in the
+    next `days_ahead` days (plus anything already in progress). This is
+    what keeps a league 'topped up' on a rolling basis instead of writing
+    the whole season at once -- mirrors config.SCRAPE_DAYS_AHEAD, the
+    same window convention the World Cup poller used to use.
+
+    If the earliest upcoming kickoff for this league is further out than
+    the window, nothing is upserted -- the season hasn't started yet, so
+    there's nothing in-window to write. This function is called on every
+    reactive rescrape (after a match completes) and on the poller's
+    twice-daily backstop, so once the season's first fixture falls inside
+    the window it starts showing up on its own -- no separate "has the
+    season started" check is needed.
+    """
+    if league_key not in config.LEAGUES:
+        raise ValueError(f"Unknown league key: {league_key!r}. Known: {list(config.LEAGUES)}")
+
+    league_cfg = config.LEAGUES[league_key]
+    competition_id = league_cfg["competition_id"]
+
+    logger.info(
+        "Fetching %s fixtures from 365Scores (competitionId=%s) for %d-day window ...",
+        league_cfg["name"], competition_id, days_ahead,
+    )
+
+    games = threesixtyfive.fetch_games_by_competition([competition_id])
+
+    if games is None:
+        logger.error("fetch_games_by_competition(%s) returned None -- network/API error", competition_id)
+        return 0
+
+    if not games:
+        logger.warning(
+            "0 games returned for %s (competitionId=%s) -- either the id is "
+            "stale or the season hasn't been scheduled by 365Scores yet.",
+            league_cfg["name"], competition_id,
+        )
+        return 0
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cutoff = now + datetime.timedelta(days=days_ahead)
+
+    in_window = []
+    for g in games:
+        kickoff = _parse_kickoff(g.get("startTime"))
+        # Include anything kicking off within the window, plus anything
+        # already in progress even if its kickoff was slightly before
+        # `now` (e.g. a match that's running long).
+        if kickoff <= cutoff and (kickoff >= now or not threesixtyfive.is_game_finished(g)):
+            in_window.append(g)
+
+    if not in_window:
+        logger.info(
+            "%s: no fixtures within the next %d days (season may not have started yet).",
+            league_cfg["name"], days_ahead,
+        )
+        return 0
+
+    logger.info(
+        "%s: %d/%d fixtures fall within the %d-day window",
+        league_cfg["name"], len(in_window), len(games), days_ahead,
+    )
+    return _upsert_games(store, in_window, league_key)
+
+
+def scrape_all_leagues_window(store: FixtureStore, days_ahead: int = 7) -> dict[str, int]:
+    """Windowed version of scrape_all_leagues -- this is what poller.py
+    calls automatically (on the reactive post-match-completion trigger
+    and the twice-daily scheduled backstop). Returns {league_key: count}."""
+    results: dict[str, int] = {}
+    for league_key in config.LEAGUES:
+        try:
+            results[league_key] = scrape_league_fixtures_window(store, league_key, days_ahead)
+        except Exception as exc:
+            logger.error("Windowed scrape failed for league=%s: %s", league_key, exc)
+            results[league_key] = 0
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Scrape league-based fixtures into the games collection.")
     parser.add_argument(
@@ -236,6 +330,17 @@ def main() -> None:
         default=None,
         help="Pin --round-only to a specific roundNum instead of auto-selecting the next unplayed round.",
     )
+    parser.add_argument(
+        "--window",
+        action="store_true",
+        help="Only fetch fixtures within --days-ahead days (rolling window), same behavior the poller runs automatically.",
+    )
+    parser.add_argument(
+        "--days-ahead",
+        type=int,
+        default=config.SCRAPE_DAYS_AHEAD,
+        help=f"Window size in days for --window (default: {config.SCRAPE_DAYS_AHEAD}, from config.SCRAPE_DAYS_AHEAD).",
+    )
     args = parser.parse_args()
 
     mongo_uri = os.environ.get("MONGO_URI")
@@ -251,6 +356,14 @@ def main() -> None:
                 sys.exit(1)
             count = scrape_one_round(store, args.league, round_num=args.round_num)
             logger.info("Round scrape complete: %d games upserted into '%s' collection.", count, config.MONGO_COLLECTION)
+        elif args.window:
+            if args.league == "all":
+                results = scrape_all_leagues_window(store, days_ahead=args.days_ahead)
+                total = sum(results.values())
+                logger.info("Windowed all-league scrape complete: %s (total=%d) into '%s' collection.", results, total, config.MONGO_COLLECTION)
+            else:
+                count = scrape_league_fixtures_window(store, args.league, days_ahead=args.days_ahead)
+                logger.info("Windowed scrape complete: %d games upserted into '%s' collection.", count, config.MONGO_COLLECTION)
         elif args.league == "all":
             results = scrape_all_leagues(store)
             total = sum(results.values())
