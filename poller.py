@@ -704,7 +704,7 @@ class Poller:
         try:
             logger.info(f"🔄 Triggering league rescrape ({reason})...")
             results = leagues_scraper.scrape_all_leagues_window(
-                self.store, days_ahead=config.SCRAPE_DAYS_AHEAD
+                self.store, days_ahead=config.REFERENCE_WINDOW_DAYS
             )
             total = sum(results.values())
             logger.info(f"✅ Rescrape complete: {results} (total={total} fixtures upserted)")

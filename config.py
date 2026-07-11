@@ -55,11 +55,8 @@ LEAGUES = {
         "name": "Premier League",
         "prefix": "epl",
     },
-    "seriea": {
-        "competition_id": 17,
-        "name": "Serie A",
-        "prefix": "seriea",
-    },
+    # "seriea" intentionally removed -- not scraped at all for now.
+    # Was: {"competition_id": 17, "name": "Serie A", "prefix": "seriea"}
     "ucl": {
         "competition_id": 572,
         "name": "UEFA Champions League",
@@ -81,3 +78,19 @@ LEAGUES = {
         "prefix": "community_shield",
     },
 }
+
+# ============================================================
+# PRIORITY-LEAGUE ROLLING WINDOW
+# ============================================================
+# Instead of anchoring the scrape window on "now" (a dead zone until the
+# priority leagues' seasons actually start), we anchor on a reference
+# date that starts here and creeps forward by one day per real calendar
+# day (see FixtureStore.advance_reference_date_if_needed). Chosen to
+# roughly line up with Community Shield / EPL preseason buildup.
+REFERENCE_DATE_DEFAULT = "2026-08-13"
+REFERENCE_WINDOW_DAYS = 9
+
+# Order matters here -- this is also the priority order used when
+# building the "top of feed" response (EPL first, down to Community
+# Shield). Qualifying rounds are excluded regardless of league.
+PRIORITY_LEAGUE_ORDER = ["epl", "ucl", "europa", "facup", "community_shield"]

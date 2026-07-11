@@ -31,6 +31,11 @@ class FixtureStore:
     def __init__(self, mongo_uri: str):
         self._client = MongoClient(mongo_uri)
         self._collection: Collection = self._client[config.MONGO_DB][config.MONGO_COLLECTION]
+        # Separate small collection for scraper-wide state (currently just
+        # the rolling reference date used to anchor the priority-league
+        # scrape window). Kept apart from `games` since it's a single
+        # config-like document, not a fixture.
+        self._state: Collection = self._client[config.MONGO_DB]["scraper_state"]
         self._ensure_indexes()
 
     def _ensure_indexes(self):
@@ -246,6 +251,86 @@ class FixtureStore:
             return datetime.fromisoformat(doc["kickoffUtc"].replace("Z", "+00:00"))
         except (ValueError, AttributeError):
             return None
+
+    # ============================================================
+    # REFERENCE-DATE STATE (rolling window anchor for priority leagues)
+    # ============================================================
+    #
+    # Instead of anchoring the scrape window on `datetime.now()` -- which
+    # right now sits in a dead zone before any of the priority leagues
+    # (EPL/UCL/Europa/FA Cup/Community Shield) have fixtures -- we anchor
+    # on a single stored "reference date" that starts at
+    # config.REFERENCE_DATE_DEFAULT and creeps forward by exactly one day
+    # per real calendar day, regardless of how many times the poller
+    # triggers a rescrape on a given day (0, 1, or a burst of several
+    # after multiple matches complete).
+    #
+    # This is enforced atomically via find_one_and_update with the
+    # "lastIncrementedDate != today" condition baked into the filter, so
+    # concurrent/repeated calls on the same day are a no-op after the
+    # first one -- no separate boolean flag to remember to reset.
+
+    _REFERENCE_STATE_ID = "reference_window"
+
+    def get_reference_date(self) -> datetime:
+        """Return the current reference date (UTC midnight). Seeds the
+        state document with config.REFERENCE_DATE_DEFAULT on first call
+        if it doesn't exist yet."""
+        doc = self._state.find_one({"_id": self._REFERENCE_STATE_ID})
+        if not doc:
+            default = datetime.fromisoformat(config.REFERENCE_DATE_DEFAULT).replace(tzinfo=timezone.utc)
+            self._state.update_one(
+                {"_id": self._REFERENCE_STATE_ID},
+                {
+                    "$setOnInsert": {
+                        "referenceDate": default.isoformat(),
+                        "lastIncrementedDate": None,
+                    }
+                },
+                upsert=True,
+            )
+            return default
+        return datetime.fromisoformat(doc["referenceDate"].replace("Z", "+00:00"))
+
+    def advance_reference_date_if_needed(self) -> datetime:
+        """Bump the reference date forward by exactly one day, but only
+        once per real calendar day no matter how many times this is
+        called. Returns the reference date AFTER the (possible) advance.
+
+        Called at the top of scrape_all_leagues_window() -- both the
+        reactive post-match-completion trigger and the twice-daily
+        scheduled backstop go through that single choke point, so this
+        naturally covers every path that can invoke the scraper.
+        """
+        today = datetime.now(timezone.utc).date().isoformat()
+
+        # Ensure the doc exists first (seeds default reference date).
+        current = self.get_reference_date()
+
+        updated = self._state.find_one_and_update(
+            {
+                "_id": self._REFERENCE_STATE_ID,
+                "lastIncrementedDate": {"$ne": today},
+            },
+            {
+                "$set": {
+                    "referenceDate": (current + timedelta(days=1)).isoformat(),
+                    "lastIncrementedDate": today,
+                },
+            },
+            return_document=True,
+        )
+
+        if updated:
+            logger.info(
+                "Reference date advanced -> %s (first trigger today)",
+                updated["referenceDate"],
+            )
+            return datetime.fromisoformat(updated["referenceDate"].replace("Z", "+00:00"))
+
+        # Guard held: already advanced today by an earlier trigger. No-op.
+        logger.debug("Reference date already advanced today -- skipping (guard held)")
+        return current
 
     def get_fixtures_by_league_round(self, league_key: str, round_num: int) -> List[Dict[str, Any]]:
         """Get all games for a given league + round number."""
