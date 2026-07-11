@@ -75,6 +75,22 @@ def _status_to_internal(status_text: str) -> str:
     return "upcoming"
 
 
+def _is_qualifying_round(game: dict, fallback_league_name: str) -> bool:
+    """True if this fixture belongs to a qualifying/preliminary round
+    rather than the main competition -- e.g. "UEFA Champions League
+    Qualifiers - 2nd Round" or "FA Cup - Qualifying Rounds - Extra
+    Preliminary Round". Checked against 365Scores' own
+    competitionDisplayName first (most reliable), falling back to the
+    configured league name and roundName in case a feed doesn't put the
+    qualifier marker in the competition name itself."""
+    text = " ".join(filter(None, [
+        game.get("competitionDisplayName"),
+        fallback_league_name,
+        game.get("roundName"),
+    ])).lower()
+    return "qualif" in text or "preliminary" in text
+
+
 def _parse_kickoff(start_time_raw: Optional[str]) -> datetime.datetime:
     now = datetime.datetime.now(datetime.timezone.utc)
     if not start_time_raw:
@@ -335,23 +351,50 @@ def scrape_league_fixtures_window(
     cutoff = reference + datetime.timedelta(days=days_ahead)
 
     in_window = []
+    skipped_before_window = 0
+    skipped_qualifier = 0
     for g in games:
         kickoff = _parse_kickoff(g.get("startTime"))
-        # Include anything kicking off within the window, plus anything
-        # already in progress even if its kickoff was slightly before
-        # `now` (e.g. a match that's running long).
-        if kickoff <= cutoff and (kickoff >= now or not threesixtyfive.is_game_finished(g)):
-            in_window.append(g)
+
+        # Lower bound: must be at or after `reference`, UNLESS the game
+        # is actually live right now -- catches a match that kicked off
+        # slightly before the window but is still being played. This is
+        # deliberately narrower than "not finished", which is true for
+        # every upcoming fixture regardless of date and was the original
+        # bug: it let e.g. an Aug-8 FA Cup qualifier through a window
+        # anchored on Aug 13, because "upcoming" games are never
+        # "finished" no matter how far away their kickoff is.
+        is_live_now = _status_to_internal(g.get("statusText", "")) == "live"
+        if kickoff < reference and not is_live_now:
+            skipped_before_window += 1
+            continue
+
+        # Upper bound: must not kick off after the window ends.
+        if kickoff > cutoff:
+            continue
+
+        # Exclude qualifying/preliminary rounds regardless of date.
+        if _is_qualifying_round(g, league_cfg["name"]):
+            skipped_qualifier += 1
+            continue
+
+        in_window.append(g)
+
+    if skipped_before_window or skipped_qualifier:
+        logger.info(
+            "%s: filtered out %d fixture(s) before the window and %d qualifying-round fixture(s)",
+            league_cfg["name"], skipped_before_window, skipped_qualifier,
+        )
 
     if not in_window:
         logger.info(
-            "%s: no fixtures within the %d-day window from %s.",
+            "%s: no non-qualifier fixtures within the %d-day window from %s.",
             league_cfg["name"], days_ahead, reference.strftime("%Y-%m-%d"),
         )
         return 0
 
     logger.info(
-        "%s: %d/%d fixtures fall within the %d-day window from %s",
+        "%s: %d/%d fixtures fall within the %d-day window from %s (qualifiers excluded)",
         league_cfg["name"], len(in_window), len(games), days_ahead, reference.strftime("%Y-%m-%d"),
     )
     return _upsert_games(store, in_window, league_key)
