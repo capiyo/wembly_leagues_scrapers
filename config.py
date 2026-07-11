@@ -88,7 +88,7 @@ LEAGUES = {
 # day (see FixtureStore.advance_reference_date_if_needed). Chosen to
 # roughly line up with Community Shield / EPL preseason buildup.
 REFERENCE_DATE_DEFAULT = "2026-08-13"
-REFERENCE_WINDOW_DAYS = 9
+REFERENCE_WINDOW_DAYS = 11
 
 # Order matters here -- this is also the priority order used when
 # building the "top of feed" response (EPL first, down to Community
