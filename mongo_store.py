@@ -220,6 +220,33 @@ class FixtureStore:
         """Get all games for a given league (e.g. 'epl', 'ucl', 'facup')."""
         return list(self._collection.find({"leagueKey": league_key}))
 
+    def get_latest_kickoff_for_league(self, league_key: str) -> Optional[datetime]:
+        """Return the kickoff time of the furthest-out fixture already
+        stored for this league -- i.e. the current 'high-water mark' of
+        what leagues_scraper.py has already scraped. Returns None if
+        nothing has been scraped for this league yet.
+
+        Used as the rolling-window cursor: instead of every scrape
+        re-anchoring on 'today' (which does nothing useful while a
+        league's season is still weeks away), the next window picks up
+        from where the previous one left off.
+
+        kickoffUtc is stored as an ISO-8601 UTC string (see
+        upsert_fixture's comment on why it can't be a native BSON Date),
+        so sorting on it lexicographically matches chronological order.
+        """
+        doc = self._collection.find_one(
+            {"leagueKey": league_key},
+            sort=[("kickoffUtc", -1)],
+            projection={"kickoffUtc": 1},
+        )
+        if not doc or not doc.get("kickoffUtc"):
+            return None
+        try:
+            return datetime.fromisoformat(doc["kickoffUtc"].replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            return None
+
     def get_fixtures_by_league_round(self, league_key: str, round_num: int) -> List[Dict[str, Any]]:
         """Get all games for a given league + round number."""
         return list(self._collection.find({"leagueKey": league_key, "roundNum": round_num}))
