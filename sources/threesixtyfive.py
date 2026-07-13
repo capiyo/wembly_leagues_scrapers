@@ -5,6 +5,7 @@ Fetches: fixtures, live scores, events, lineups, statistics, and commentary.
 from __future__ import annotations
 
 import logging
+import re
 import requests
 from typing import List, Dict, Any, Optional
 
@@ -93,18 +94,18 @@ def fetch_games_by_competition(
     }
 
     url = f"{BASE_URL}/web/games/fixtures/"
-    
+
     try:
         logger.debug(f"Fetching from {url} with params {params}")
         response = requests.get(url, headers=DEFAULT_HEADERS, params=params, timeout=30)
         response.raise_for_status()
-        
+
         data = response.json()
         games = data.get("games", [])
         logger.info(f"fetch_games_by_competition({competition_ids}): {len(games)} games returned")
-        
+
         return games
-        
+
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to fetch games from 365Scores: {e}")
         return None
@@ -123,7 +124,7 @@ def fetch_game_details(
 ) -> Optional[Dict[str, Any]]:
     """
     Fetch full game details including lineups using the /web/game/ endpoint.
-    
+
     Args:
         game_id: 365Scores game ID (e.g., "4627864")
         away_id: Away team competitor ID
@@ -131,12 +132,12 @@ def fetch_game_details(
         competition_id: Competition ID (e.g., 5930)
         lang_id: Language ID (1 = English)
         user_country_id: Country ID (413 = Kenya)
-    
+
     Returns:
         Full game data including lineups, statistics, events, commentary
     """
     matchup_id = f"{away_id}-{home_id}-{competition_id}"
-    
+
     params = {
         "appTypeId": 5,
         "langId": lang_id,
@@ -145,18 +146,18 @@ def fetch_game_details(
         "gameId": game_id,
         "matchupId": matchup_id,
     }
-    
+
     url = f"{BASE_URL}/web/game/"
-    
+
     try:
         logger.debug(f"Fetching game details from {url} with params {params}")
         response = requests.get(url, headers=DEFAULT_HEADERS, params=params, timeout=30)
         response.raise_for_status()
-        
+
         data = response.json()
         logger.info(f"fetch_game_details({game_id}): Success")
         return data
-        
+
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to fetch game details for {game_id}: {e}")
         return None
@@ -173,7 +174,7 @@ def fetch_lineups(
 ) -> Optional[Dict[str, Any]]:
     """
     Fetch only lineups from the game details endpoint.
-    
+
     Returns:
         {
             "home": {
@@ -189,19 +190,19 @@ def fetch_lineups(
         }
     """
     data = fetch_game_details(game_id, away_id, home_id, competition_id)
-    
+
     if not data or "game" not in data:
         logger.warning(f"No game data found for {game_id}")
         return None
-    
+
     game = data.get("game", {})
-    
+
     home_competitor = game.get("homeCompetitor", {})
     away_competitor = game.get("awayCompetitor", {})
-    
+
     home_lineups = home_competitor.get("lineups")
     away_lineups = away_competitor.get("lineups")
-    
+
     if not home_lineups and not away_lineups:
         logger.debug(f"No lineups available for {game_id}")
         return None
@@ -231,12 +232,10 @@ def fetch_lineups(
         "home": home_lineups or {},
         "away": away_lineups or {},
     }
-    
+
     logger.info(f"fetch_lineups({game_id}): Found lineups")
     return result
 
-
-import re
 
 # All keywords are matched with regex word boundaries (\b), never plain
 # substring containment -- naive "in" checks cause false positives like
@@ -322,47 +321,45 @@ def fetch_statistics(
     to avoid a redundant network request.
     """
     data = fetch_game_details(game_id, away_id, home_id, competition_id)
-    
+
     if not data or "game" not in data:
         return None
-    
+
     game = data.get("game", {})
     return extract_statistics_from_game(game)
 
 
-def fetch_commentary(
+# ============================================================================
+# PLAY-BY-PLAY FEED (shared by fetch_commentary and fetch_match_events)
+# ----------------------------------------------------------------------------
+# The /web/game/ endpoint does NOT embed commentary or a discrete events
+# list directly -- game.commentary and game.events are not real fields.
+# It only returns game.playByPlay.feedURL, a pointer to a separate feed
+# (pbpgenerator.365scores.com). That feed is the ONLY place 365Scores
+# exposes per-event type/minute/side data; the cumulative counters used
+# by extract_statistics_from_game() (homeCorners, homeYellowCards, ...)
+# have no per-event breakdown.
+#
+# Two things the raw feed gets wrong that we correct here:
+#   1. The feedURL 365Scores returns comes pre-built with lang=37
+#      (Dutch), not English -- every other endpoint in this file uses
+#      langId=1, so we force lang=1 here too before fetching.
+#   2. Entry field names are PascalCase (.NET-style): Comment, Timeline,
+#      Type, TypeName, Period, Title, IsMajor, Players, CompetitorNum --
+#      not the lowercase minute/text/type/team/player shape used
+#      elsewhere in this codebase.
+# ============================================================================
+
+def _fetch_play_by_play_raw(
     game_id: str,
     away_id: int,
     home_id: int,
     competition_id: int
 ) -> List[Dict[str, Any]]:
-    """
-    Fetch commentary via 365Scores' separate play-by-play feed
-    (pbpgenerator.365scores.com). The /web/game/ endpoint does NOT embed
-    commentary text directly -- game.commentary is not a real field. It
-    only returns game.playByPlay.feedURL, a pointer to this separate feed.
-
-    Two things the raw feed gets wrong that we correct here:
-      1. The feedURL 365Scores returns comes pre-built with lang=37
-         (Dutch), not English -- every other endpoint in this file uses
-         langId=1, so we force lang=1 here too before fetching.
-      2. Entry field names are PascalCase (.NET-style): Comment, Timeline,
-         Type, TypeName, Period, Title, IsMajor, Players -- not the
-         lowercase minute/text/type/team/player shape used elsewhere.
-         Kickoff / half-end markers have no "Comment" field -- they use
-         "Title" instead (e.g. "Rust 0-0" / half-time score) -- so we
-         fall back to Title.
-
-    Returns:
-        List of commentary entries with:
-        {
-            "minute": int,
-            "text": str,
-            "type": str,
-            "team": Optional[str],
-            "player": Optional[str],
-        }
-        Note: createdAt is added by the poller when forwarding.
+    """Shared fetch + unwrap for the play-by-play feed. Both
+    fetch_commentary() and fetch_match_events() parse this same raw list
+    into different shapes -- this only does the network call + finding
+    the entry list in the response, not any field-level interpretation.
     """
     data = fetch_game_details(game_id, away_id, home_id, competition_id)
 
@@ -393,17 +390,61 @@ def fetch_commentary(
 
     # We don't rely on knowing the exact wrapper key name -- find the
     # first top-level list of dicts in the response instead.
-    raw_commentary = []
     if isinstance(raw, list):
-        raw_commentary = raw
-    elif isinstance(raw, dict):
+        return raw
+    if isinstance(raw, dict):
         for value in raw.values():
             if isinstance(value, list) and value and isinstance(value[0], dict):
-                raw_commentary = value
-                break
+                return value
 
+    return []
+
+
+def _competitor_num_to_side(competitor_num: Any) -> Optional[str]:
+    """365Scores' play-by-play feed marks each entry with CompetitorNum
+    (1 or 2), not a competitor id -- it can't be joined against
+    homeCompetitor/awayCompetitor.id the way fetch_lineups() joins
+    roster members.
+
+    UNCONFIRMED against a live payload: assuming NUM 1 = home,
+    NUM 2 = away, matching the ordering 365Scores uses everywhere else
+    in this file (homeCompetitor first, awayCompetitor second). Verify
+    against one real play-by-play response before trusting this for
+    actual sub-fixture settlement -- if it's backwards, every
+    first_goal/first_card/first_corner market will settle to the wrong
+    team.
+    """
+    if competitor_num == 1:
+        return "home"
+    if competitor_num == 2:
+        return "away"
+    return None
+
+
+def fetch_commentary(
+    game_id: str,
+    away_id: int,
+    home_id: int,
+    competition_id: int
+) -> List[Dict[str, Any]]:
+    """
+    Fetch commentary via 365Scores' separate play-by-play feed. See the
+    module-level comment above _fetch_play_by_play_raw for why this
+    can't come from the /web/game/ response directly.
+
+    Returns:
+        List of commentary entries with:
+        {
+            "minute": int,
+            "text": str,
+            "type": str,
+            "team": Optional[str],   # "home" | "away" | None
+            "player": Optional[str],
+        }
+        Note: createdAt is added by the poller when forwarding.
+    """
+    raw_commentary = _fetch_play_by_play_raw(game_id, away_id, home_id, competition_id)
     if not raw_commentary:
-        logger.debug(f"No commentary entries in play-by-play feed for {game_id}")
         return []
 
     commentary_list = []
@@ -423,12 +464,107 @@ def fetch_commentary(
             "minute": minute,
             "text": text,
             "type": entry.get("TypeName", "commentary"),
-            "team": None,  # not directly present -- CompetitorNum(1/2) could be mapped to team name if needed later
+            "team": _competitor_num_to_side(entry.get("CompetitorNum")),
             "player": player,
         })
 
     logger.info(f"fetch_commentary({game_id}): Found {len(commentary_list)} entries")
     return commentary_list
+
+
+# TypeName markers for classifying play-by-play entries into the three
+# sub-fixture event buckets. Matched as substrings against the lowercased
+# TypeName -- these are guesses at 365Scores' actual English TypeName
+# strings ("Goal", "Yellow Card", "Red Card", "Corner", etc.) based on
+# common convention across similar feeds; confirm against a real payload
+# and adjust if 365Scores uses different wording.
+_CARD_TYPENAME_MARKERS = ("yellow card", "red card", "second yellow")
+_CORNER_TYPENAME_MARKERS = ("corner",)
+_GOAL_TYPENAME_MARKERS = ("goal",)  # checked last: "goal" is a substring of nothing above, but keep order defensive
+
+
+def _classify_event_typename(type_name: Optional[str]) -> Optional[str]:
+    t = (type_name or "").strip().lower()
+    if any(m in t for m in _CARD_TYPENAME_MARKERS):
+        return "card"
+    if any(m in t for m in _CORNER_TYPENAME_MARKERS):
+        return "corner"
+    if any(m in t for m in _GOAL_TYPENAME_MARKERS):
+        return "goal"
+    return None
+
+
+def fetch_match_events(
+    game_id: str,
+    away_id: int,
+    home_id: int,
+    competition_id: int
+) -> List[Dict[str, Any]]:
+    """
+    Discrete goal/card/corner events, derived from the SAME play-by-play
+    feed fetch_commentary() reads. This is what feeds the first_goal /
+    first_card / first_corner sub-fixture markets -- there is no other
+    per-event data source in this API client.
+
+    Returns [{event_type, minute, team, player}, ...] for entries
+    classified as goal/card/corner, sorted by minute. Anything else in
+    the feed (kickoff markers, half-end markers, general commentary) is
+    skipped here -- fetch_commentary() still returns those separately
+    for the chat/commentary feed; this makes its own network call rather
+    than sharing a single fetch with fetch_commentary(), consistent with
+    how fetch_statistics()/fetch_lineups()/fetch_commentary() each
+    already make independent fetch_game_details() calls in this file.
+
+    KNOWN GAPS, both flagged inline where they matter:
+      - Team attribution (_competitor_num_to_side) assumes
+        CompetitorNum 1=home, 2=away -- unconfirmed against a live
+        payload.
+      - Own goals are not special-cased. A TypeName containing "goal"
+        for an own goal will attribute the event to whichever side
+        CompetitorNum points at (likely the scoring player's own team),
+        which is backwards for a first_goal market -- an own goal by
+        the away team should count as a home team's "first goal" for
+        settlement purposes. Needs a real payload to know whether
+        365Scores' TypeName distinguishes "Own Goal" from "Goal" so
+        this can be corrected.
+    """
+    raw_commentary = _fetch_play_by_play_raw(game_id, away_id, home_id, competition_id)
+    if not raw_commentary:
+        return []
+
+    events: List[Dict[str, Any]] = []
+    for entry in raw_commentary:
+        event_type = _classify_event_typename(entry.get("TypeName"))
+        if event_type is None:
+            continue
+
+        team = _competitor_num_to_side(entry.get("CompetitorNum"))
+        if team is None:
+            logger.debug(
+                f"{game_id}: skipping {event_type} event with unresolvable team "
+                f"(CompetitorNum={entry.get('CompetitorNum')!r})"
+            )
+            continue
+
+        minute_raw = entry.get("Timeline")
+        try:
+            minute = int(minute_raw) if minute_raw is not None else 0
+        except (ValueError, TypeError):
+            minute = 0
+
+        players = entry.get("Players") or []
+        player = players[0].get("PlayerName") if players else None
+
+        events.append({
+            "event_type": event_type,
+            "minute": minute,
+            "team": team,
+            "player": player,
+        })
+
+    events.sort(key=lambda e: e["minute"])
+    logger.info(f"fetch_match_events({game_id}): Found {len(events)} goal/card/corner events")
+    return events
 
 
 def fetch_complete_match_data(
@@ -441,12 +577,12 @@ def fetch_complete_match_data(
     Fetch all match data: details, lineups, statistics, and commentary in one go.
     """
     data = fetch_game_details(game_id, away_id, home_id, competition_id)
-    
+
     if not data or "game" not in data:
         return None
-    
+
     game = data.get("game", {})
-    
+
     return {
         "game_id": game_id,
         "details": game,

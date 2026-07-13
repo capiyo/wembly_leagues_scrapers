@@ -8,6 +8,7 @@ import logging
 import requests
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timezone
+
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -18,14 +19,13 @@ class Forwarder:
     def __init__(self, api_url: str, timeout: int = 30, max_retries: int = 3):
         self.api_url = api_url.rstrip("/")
         self.timeout = timeout
-        
         self.session = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
             "Accept": "application/json",
             "User-Agent": "WorldCupPoller/1.0",
         })
-        
+
         retry_strategy = Retry(
             total=max_retries,
             backoff_factor=1,
@@ -47,8 +47,8 @@ class Forwarder:
             logger.error(f"Failed to POST to {endpoint}: {e}")
             if hasattr(e, 'response') and e.response:
                 logger.error(f"Response: {e.response.text[:500]}")
-                import json
-                logger.error(f"Payload: {json.dumps(data, indent=2)[:1000]}")
+            import json
+            logger.error(f"Payload: {json.dumps(data, indent=2)[:1000]}")
             return False
 
     def _put(self, endpoint: str, data: Dict[str, Any]) -> bool:
@@ -95,7 +95,6 @@ class Forwarder:
     # ============================================================
     # LIVE UPDATES
     # ============================================================
-
     def forward_live_update(self, update: Dict[str, Any]) -> bool:
         payload = self._clean({
             "fixtureId": update.get("fixture_id"),
@@ -118,7 +117,6 @@ class Forwarder:
     # ============================================================
     # COMMENTARY
     # ============================================================
-
     def _normalize_commentary_entry(self, entry: Dict[str, Any]) -> Dict[str, Any]:
         try:
             minute = int(entry.get("minute", 0))
@@ -151,7 +149,6 @@ class Forwarder:
     def forward_commentary(self, commentary: Dict[str, Any]) -> bool:
         entry = commentary.get("entry", {})
         match_id = commentary.get("match_id")
-
         if not match_id:
             logger.error("Missing match_id in commentary")
             return False
@@ -160,7 +157,6 @@ class Forwarder:
             "match_id": str(match_id),
             "entry": self._normalize_commentary_entry(entry),
         }
-
         logger.debug(f"📤 Commentary payload: {payload}")
         return self._post("/games/commentary", payload)
 
@@ -176,7 +172,6 @@ class Forwarder:
             "match_id": str(fixture_id),
             "entries": normalized,
         }
-
         logger.debug(
             f"📤 Bulk commentary payload: {len(normalized)} entries for {fixture_id}"
         )
@@ -185,10 +180,8 @@ class Forwarder:
     # ============================================================
     # STATISTICS
     # ============================================================
-
     def forward_statistics(self, statistics: Dict[str, Any]) -> bool:
         stats = statistics.get("statistics", {})
-        
         payload = self._clean({
             "fixture_id": statistics.get("fixture_id"),
             "minute": int(statistics.get("minute", 0)),
@@ -197,17 +190,14 @@ class Forwarder:
                 "away": self._clean(stats.get("away", {})),
             }
         })
-        
         if payload.get("fixture_id") is None:
             logger.error("Missing fixture_id in statistics")
             return False
-            
         return self._post("/games/statistics", payload)
 
     # ============================================================
     # LINEUPS
     # ============================================================
-
     def forward_lineups(self, lineups: Dict[str, Any]) -> bool:
         lineups_data = lineups.get("lineups", {})
 
@@ -218,22 +208,18 @@ class Forwarder:
                 if isinstance(position, dict)
                 else position
             ) or ""
-
             jersey_number = (
                 member.get("jerseyNumber")
                 or member.get("shirtNumber")
                 or member.get("num")
                 or 0
             )
-
             captain = bool(
                 member.get("captain")
                 or member.get("isCaptain")
                 or member.get("captainFlag")
             )
-
             player_id = member.get("id") or member.get("playerId")
-
             return {
                 "name": member.get("name") or member.get("shortName") or "Unknown",
                 "position": position_name,
@@ -248,7 +234,6 @@ class Forwarder:
             starting = [clean_player(m) for m in members if m.get("status") == 1]
             bench = [clean_player(m) for m in members if m.get("status") != 1]
             bench.extend(clean_player(m) for m in data.get("bench", []))
-
             return {
                 "formation": data.get("formation", "4-4-2"),
                 "coach": {"name": data.get("coach", {}).get("name", "Unknown")},
@@ -265,25 +250,22 @@ class Forwarder:
                 "away": clean_team(lineups_data.get("away", {})),
             }
         })
-        
         if payload.get("fixtureId") is None:
             logger.error("Missing fixtureId in lineups")
             return False
-            
         return self._post("/games/lineups", payload)
 
     # ============================================================
     # BET SETTLEMENT
     # ============================================================
-
     def settle_bets(self, fixture_id: str, result: str) -> bool:
         """
         Settle all bets for a completed match.
-        
+
         Args:
             fixture_id: The match ID (e.g., "wc26_4627864")
             result: "home", "away", or "draw"
-        
+
         Returns:
             True if settlement succeeded, False otherwise
         """
@@ -295,14 +277,12 @@ class Forwarder:
             "fixture_id": fixture_id,
             "result": result,
         }
-        
         logger.info(f"💰 Settling bets for {fixture_id} with result: {result}")
         return self._post("/actions/bet/settle", payload)
 
     # ============================================================
     # HISTORY / ARCHIVE
     # ============================================================
-
     def move_to_history(self, fixture_id: str) -> bool:
         """Move a completed match to history."""
         if not fixture_id:
@@ -313,7 +293,6 @@ class Forwarder:
     # ============================================================
     # OTHER METHODS
     # ============================================================
-
     def forward_fixture(self, fixture: Dict[str, Any]) -> bool:
         return self._post("/games", fixture)
 
@@ -350,6 +329,37 @@ class Forwarder:
             "awayScore": int(event.get("away_score", 0)),
         })
         return self._post("/games/events", payload)
+
+    def forward_match_events_bulk(self, fixture_id: str, events: List[Dict[str, Any]]) -> bool:
+        """Discrete goal/card/corner events for sub-fixture settlement --
+        distinct from forward_event() above, which is a single-event
+        notification-shaped call (carries homeScore/awayScore/assist for
+        a goal_scored-style push). This one is a plain bulk list matching
+        MatchEventsBulkRequest/MatchEventPayload on the Rust side:
+        {fixture_id, events: [{event_type, minute, team, player}, ...]}.
+        """
+        if not fixture_id:
+            logger.error("Missing fixture_id in bulk match events")
+            return False
+        if not events:
+            return True
+
+        normalized = [
+            self._clean({
+                "event_type": e.get("event_type"),
+                "minute": int(e.get("minute", 0)),
+                "team": e.get("team"),
+                "player": e.get("player"),
+            })
+            for e in events
+        ]
+
+        payload = {
+            "fixture_id": str(fixture_id),
+            "events": normalized,
+        }
+        logger.debug(f"📤 Bulk match events payload: {len(normalized)} events for {fixture_id}")
+        return self._post("/games/events/bulk", payload)
 
     def forward_notification(self, notification: Dict[str, Any]) -> bool:
         payload = self._clean({
@@ -454,7 +464,6 @@ class Forwarder:
     # ============================================================
     # GAME MANAGEMENT
     # ============================================================
-
     def get_game(self, match_id: str) -> Optional[Dict[str, Any]]:
         return self._get(f"/games/match/{match_id}")
 
@@ -476,7 +485,6 @@ class Forwarder:
     # ============================================================
     # HEALTH CHECK
     # ============================================================
-
     def health_check(self) -> bool:
         result = self._get("/health")
         return result is not None and result.get("status") == "healthy"
