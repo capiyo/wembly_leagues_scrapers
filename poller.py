@@ -50,6 +50,18 @@ STATUS_GROUP_SCHEDULED = 2
 STATUS_GROUP_LIVE = 3
 STATUS_GROUP_FINISHED = 4
 
+# Sub-fixture market ids used when settling first_goal/first_card/
+# first_corner/over_under markets against the Rust /sub_fixtures API.
+#
+# ASSUMPTION (UNCONFIRMED): these strings must exactly match whatever
+# market_id was used when the SubFixtureMarket/bets were created for a
+# given match. This poller has no visibility into that creation flow --
+# if it uses different ids, update these constants to match.
+MARKET_ID_FIRST_GOAL = "first_goal"
+MARKET_ID_FIRST_CARD = "first_card"
+MARKET_ID_FIRST_CORNER = "first_corner"
+MARKET_ID_OVER_UNDER_2_5 = "over_under_2_5"
+
 
 class MatchStateMachine:
     def __init__(self, store: FixtureStore, forwarder: Forwarder):
@@ -60,6 +72,10 @@ class MatchStateMachine:
         self.completed_notified = set()
         self.settlement_retries = {}  # match_id -> attempt_count
         self.max_settlement_retries = 3
+        # (match_id, market_id) pairs already settled, so a market never
+        # gets double-settled across poll cycles or after a poller restart
+        # within the same process lifetime.
+        self.settled_sub_fixture_markets = set()
 
     def determine_state(self, match: Dict[str, Any]) -> str:
         """Determine the current state based on kickoff time."""
@@ -186,6 +202,12 @@ class MatchStateMachine:
 
     def mark_settlement_success(self, match_id: str):
         self.settlement_retries.pop(match_id, None)
+
+    def is_sub_fixture_market_settled(self, match_id: str, market_id: str) -> bool:
+        return (match_id, market_id) in self.settled_sub_fixture_markets
+
+    def mark_sub_fixture_market_settled(self, match_id: str, market_id: str):
+        self.settled_sub_fixture_markets.add((match_id, market_id))
 
     def mark_lineups_done(self, match_id: str):
         self.lineups_fetched.add(match_id)
@@ -583,6 +605,8 @@ class Poller:
 
         logger.info(f"💰 Settling bets for {match_id}: {result} ({home_score}-{away_score})")
 
+        self._settle_over_under_market(match_id, home_score, away_score)
+
         settle_success = self.forwarder.settle_bets(match_id, result)
 
         if settle_success:
@@ -603,6 +627,73 @@ class Poller:
             logger.warning(
                 f"⚠️ Settlement failed for {match_id} (attempt {self.state_machine.settlement_retries.get(match_id, 0)})"
             )
+
+    def _check_first_event_markets(self, match: Dict[str, Any], events: list):
+        """Settle first_goal/first_card/first_corner the moment the first
+        qualifying event for each type appears in the play-by-play feed.
+
+        `events` comes from threesixtyfive.fetch_match_events(), already
+        sorted by minute. KNOWN GAP inherited from that function: own
+        goals and CompetitorNum->side mapping are not corrected here --
+        see the flags in sources/threesixtyfive.py.
+        """
+        match_id = match.get("matchId")
+        if not events:
+            return
+
+        seen_types = set()
+        for event in events:
+            event_type = event.get("event_type")
+            if event_type in seen_types:
+                continue
+            seen_types.add(event_type)
+
+            market_id = {
+                "goal": MARKET_ID_FIRST_GOAL,
+                "card": MARKET_ID_FIRST_CARD,
+                "corner": MARKET_ID_FIRST_CORNER,
+            }.get(event_type)
+
+            if not market_id:
+                continue
+
+            if self.state_machine.is_sub_fixture_market_settled(match_id, market_id):
+                continue
+
+            team = event.get("team")
+            if not team:
+                logger.debug(f"{match_id}: first {event_type} has no resolvable team, skipping settlement")
+                continue
+
+            logger.info(f"🎯 {match_id}: first {event_type} -> {team} at {event.get('minute')}'")
+            success = self.forwarder.settle_sub_fixture_market(match_id, market_id, team)
+            if success:
+                self.state_machine.mark_sub_fixture_market_settled(match_id, market_id)
+            else:
+                logger.warning(f"⚠️ Failed to settle {market_id} for {match_id}, will retry next poll")
+
+    def _settle_over_under_market(self, match_id: str, home_score: Optional[int], away_score: Optional[int]):
+        """Settle the over/under 2.5 goals sub-fixture market once the
+        match has a final score. Safe to call more than once -- dedup is
+        handled via state_machine.is_sub_fixture_market_settled."""
+        market_id = MARKET_ID_OVER_UNDER_2_5
+
+        if self.state_machine.is_sub_fixture_market_settled(match_id, market_id):
+            return
+
+        if home_score is None or away_score is None:
+            logger.warning(f"⚠️ {match_id}: missing final score, cannot settle {market_id}")
+            return
+
+        total_goals = home_score + away_score
+        result = "over" if total_goals > 2.5 else "under"
+
+        logger.info(f"📊 {match_id}: {market_id} -> {result} ({total_goals} goals)")
+        success = self.forwarder.settle_sub_fixture_market(match_id, market_id, result)
+        if success:
+            self.state_machine.mark_sub_fixture_market_settled(match_id, market_id)
+        else:
+            logger.warning(f"⚠️ Failed to settle {market_id} for {match_id}, will retry next poll")
 
     def _fetch_live_updates(self, match: Dict[str, Any]):
         match_id = match.get("matchId")
@@ -641,6 +732,19 @@ class Poller:
             self.store.update_score(match_id, home_score, away_score)
             logger.info(f"📊 {match_id}: Score updated {home_score}-{away_score}")
 
+        try:
+            events = threesixtyfive.fetch_match_events(
+                game_id=game_id,
+                away_id=away_id,
+                home_id=home_id,
+                competition_id=competition_id,
+            )
+        except Exception as e:
+            logger.error(f"❌ Failed to fetch match events for {match_id}: {e}")
+            events = []
+
+        self._check_first_event_markets(match, events)
+
         phase = threesixtyfive.classify_match_phase(status_text)
 
         if self.state_machine.should_forward_statistics(match_id, phase):
@@ -661,6 +765,11 @@ class Poller:
             if not self.state_machine.should_retry_settlement(match_id):
                 logger.warning(f"⚠️ {match_id}: Max settlement retries reached, forcing completion")
                 self.store.update_status(match_id, "completed")
+                self._settle_over_under_market(
+                    match_id,
+                    home_comp.get("score"),
+                    away_comp.get("score"),
+                )
                 self._finalize_match_result(match)
                 return
 

@@ -281,6 +281,42 @@ class Forwarder:
         return self._post("/actions/bet/settle", payload)
 
     # ============================================================
+    # SUB-FIXTURE SETTLEMENT
+    # ============================================================
+    def settle_sub_fixture_market(self, match_id: str, market_id: str, winning_team: Optional[str]) -> bool:
+        """
+        Settle a sub-fixture market (first_goal, first_card, first_corner,
+        over_under_2_5, etc.) once its outcome is known.
+
+        This is a DIFFERENT system from settle_bets() above: settle_bets
+        settles the main match-winner pool via /actions/bet/settle,
+        against the `bets` collection. This hits the new route added to
+        sub_fixture_handler.rs / sub_fixture_routes.rs (settle_sub_fixture_
+        market_handler), which settles the `sub_fixture_bets` collection.
+
+        ASSUMPTION (UNCONFIRMED): the routes are nested as
+        "/api/sub_fixtures" + "/sub-fixture/settle" in main.rs, and
+        self.api_url already ends in "/api" (it does by default --
+        see FANCLASH_API). That makes the path relative to api_url
+        "/sub_fixtures/sub-fixture/settle". Verify against your actual
+        main.rs nesting and adjust the endpoint string below if it's
+        mounted differently.
+
+        Args:
+            match_id: The match ID (matches SubFixtureBet.match_id)
+            market_id: The sub-fixture market id, e.g. "first_goal"
+            winning_team: "home", "away", "over", "under", or None for
+                a draw/no-winner (Rust side refunds both parties)
+        """
+        payload = self._clean({
+            "match_id": match_id,
+            "market_id": market_id,
+            "winning_team": winning_team,
+        })
+        logger.info(f"🏁 Settling sub-fixture {market_id} for {match_id} -> {winning_team}")
+        return self._post("/sub_fixtures/sub-fixture/settle", payload)
+
+    # ============================================================
     # HISTORY / ARCHIVE
     # ============================================================
     def move_to_history(self, fixture_id: str) -> bool:
