@@ -293,44 +293,50 @@ class FixtureStore:
         return datetime.fromisoformat(doc["referenceDate"].replace("Z", "+00:00"))
 
     def advance_reference_date_if_needed(self) -> datetime:
-        """Bump the reference date forward by exactly one day, but only
-        once per real calendar day no matter how many times this is
-        called. Returns the reference date AFTER the (possible) advance.
+        """Return the effective reference date: max(today, seed).
 
-        Called at the top of scrape_all_leagues_window() -- both the
-        reactive post-match-completion trigger and the twice-daily
-        scheduled backstop go through that single choke point, so this
-        naturally covers every path that can invoke the scraper.
+        Previously this incremented a persisted value by exactly +1 day
+        per real calendar day, starting from config.REFERENCE_DATE_DEFAULT.
+        That seemed equivalent to "track real time" but wasn't: the GAP
+        between referenceDate and the real clock was fixed at whatever it
+        happened to be the day this table was first seeded, and never
+        closed -- because both values were advancing at the same +1/day
+        rate independently, in parallel, rather than one tracking the
+        other. If the poller had already been running for N days before
+        the seed date arrived, referenceDate stayed permanently ~N days
+        ahead of "today", racing straight through real near-term fixtures
+        (e.g. the Community Shield) while they were still weeks away in
+        real time, and never coming back around to include them since the
+        value only ever climbed.
+
+        max(now, seed) has no such drift: before "today" reaches the seed
+        date it holds steady at the seed (skipping the pre-season dead
+        zone, same as before), and the moment real "today" reaches or
+        passes the seed date, the reference simply *is* today from then
+        on -- permanently in sync, no persisted increment needed.
+
+        Still writes the state doc on every call (cheap upsert) purely
+        for observability/debugging -- nothing downstream depends on the
+        stored value being anything other than a mirror of the return
+        value here.
         """
-        today = datetime.now(timezone.utc).date().isoformat()
+        today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        seed = datetime.fromisoformat(config.REFERENCE_DATE_DEFAULT).replace(tzinfo=timezone.utc)
+        reference = max(today, seed)
 
-        # Ensure the doc exists first (seeds default reference date).
-        current = self.get_reference_date()
-
-        updated = self._state.find_one_and_update(
-            {
-                "_id": self._REFERENCE_STATE_ID,
-                "lastIncrementedDate": {"$ne": today},
-            },
+        self._state.update_one(
+            {"_id": self._REFERENCE_STATE_ID},
             {
                 "$set": {
-                    "referenceDate": (current + timedelta(days=1)).isoformat(),
-                    "lastIncrementedDate": today,
+                    "referenceDate": reference.isoformat(),
+                    "lastComputedAt": datetime.now(timezone.utc).isoformat(),
                 },
             },
-            return_document=True,
+            upsert=True,
         )
 
-        if updated:
-            logger.info(
-                "Reference date advanced -> %s (first trigger today)",
-                updated["referenceDate"],
-            )
-            return datetime.fromisoformat(updated["referenceDate"].replace("Z", "+00:00"))
-
-        # Guard held: already advanced today by an earlier trigger. No-op.
-        logger.debug("Reference date already advanced today -- skipping (guard held)")
-        return current
+        logger.info("Reference date = %s (max(today, seed))", reference.strftime("%Y-%m-%d"))
+        return reference
 
     def get_fixtures_by_league_round(self, league_key: str, round_num: int) -> List[Dict[str, Any]]:
         """Get all games for a given league + round number."""
