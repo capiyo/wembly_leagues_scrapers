@@ -365,7 +365,16 @@ def scrape_league_fixtures_window(
         # anchored on Aug 13, because "upcoming" games are never
         # "finished" no matter how far away their kickoff is.
         is_live_now = _status_to_internal(g.get("statusText", "")) == "live"
-        if kickoff < reference and not is_live_now:
+        # Compare calendar dates, not exact datetimes, for the lower bound.
+        # `reference` can advance to "tomorrow" at any point during today
+        # (the twice-daily backstop fires on a fixed clock, unrelated to
+        # any specific match's kickoff time) -- comparing full datetimes
+        # meant a fixture kicking off later THAT SAME DAY as the old
+        # reference value could get excluded hours before it even played,
+        # simply because the shared reference had already ticked over to
+        # the next day. A fixture is only "before the window" once its
+        # kickoff falls on an earlier calendar date than the reference.
+        if kickoff.date() < reference.date() and not is_live_now:
             skipped_before_window += 1
             continue
 

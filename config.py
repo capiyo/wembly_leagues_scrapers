@@ -55,8 +55,11 @@ LEAGUES = {
         "name": "Premier League",
         "prefix": "epl",
     },
-    # "seriea" intentionally removed -- not scraped at all for now.
-    # Was: {"competition_id": 17, "name": "Serie A", "prefix": "seriea"}
+    "seriea": {
+        "competition_id": 17,
+        "name": "Serie A",
+        "prefix": "seriea",
+    },
     "ucl": {
         "competition_id": 572,
         "name": "UEFA Champions League",
