@@ -6,7 +6,8 @@ write/query used snake_case, causing every fixture document to fail
 deserialization on the Rust side ("invalid type: map, expected a string" /
 documents silently skipped in GET /api/games).
 
-Handles: fixtures, lineups, statistics, events, commentary, state management.
+Handles: fixtures, lineups, statistics, events, commentary, state management,
+and sub-fixture markets (first_goal / first_card / first_corner props).
 
 NOTE: Flashscore cross-reference bookkeeping (flashscore_id,
 flashscore_resolve_attempts, needs_flashscore_resolution(), etc.) has been
@@ -868,6 +869,167 @@ class FixtureStore:
         )
 
 
+# ============================================================
+# SUB-FIXTURE MARKETS (first_goal / first_card / first_corner props)
+# ============================================================
+# Confirmed against sub_fixture_handler.rs: state.db.collection(
+# "sub_fixture_markets") is what every read handler opens
+# (get_markets_for_match_handler, get_sub_fixture_visibility_handler,
+# get_market_details_handler) -- this class writes to the same collection,
+# same database (config.MONGO_DB), same MongoClient pattern as FixtureStore.
+#
+# Field names match Rust's SubFixtureMarket struct exactly
+# (#[serde(rename_all = "camelCase")] on the whole struct, unlike Game
+# which uses per-field #[serde(rename = "...")]): matchId, marketId,
+# marketType, options, line, status, lockAt, pledgeCounts, pledgeTotals,
+# result, isVisible, createdAt, updatedAt, settledAt.
+#
+# CALL DISCIPLINE, matching this file's zombie-doc lesson from
+# add_commentary/add_statistics_snapshot/store_lineups above: create_market
+# is intentionally upsert=True, but that's safe here ONLY because the
+# intended caller is leagues_scraper.py's _upsert_games gated on
+# upsert_fixture(...) returning True (i.e. fires exactly once, at the
+# moment a fixture is first created) -- never from a polling/refresh path
+# that runs repeatedly regardless of whether the fixture is new. If a
+# future caller invokes create_market() from a hot loop the way
+# add_commentary() used to be called, it will recreate a market doc after
+# a real one was deleted, the same way the old commentary bug recreated
+# zombie fixtures. Don't call this from anywhere except the one-time
+# fixture-creation branch.
+#
+# KNOWN OUTSTANDING ISSUE (Rust-side, not fixed by this file): the three
+# read handlers in sub_fixture_handler.rs query with snake_case keys
+# ("match_id", "is_visible") via the doc! macro, which does NOT go through
+# serde's rename -- so they will never match documents written with the
+# camelCase keys below (matchId, isVisible), and creates via this class
+# will still show up as empty results until those three `doc!` filters are
+# changed to "matchId" / "isVisible" on the Rust side.
+class SubFixtureStore:
+    def __init__(self, mongo_uri: str):
+        self._client = MongoClient(mongo_uri)
+        self._collection: Collection = self._client[config.MONGO_DB][
+            "sub_fixture_markets"
+        ]
+        self._ensure_indexes()
+
+    def _ensure_indexes(self):
+        """market_id is only unique per match_id (e.g. every match has its
+        own "<match_id>_first_goal"), so this is a compound index, not a
+        unique index on marketId alone."""
+        try:
+            self._collection.create_index(
+                [("matchId", 1), ("marketId", 1)], unique=True
+            )
+            self._collection.create_index("matchId")
+        except Exception as e:
+            logger.warning(f"sub_fixture_markets index issue: {e}")
+
+    def create_market(
+        self,
+        match_id: str,
+        market_type: str,  # "first_goal" | "first_card" | "first_corner"
+        options: List[str],  # e.g. ["home", "away"]
+        line: Optional[float] = None,
+        lock_at: Optional[datetime] = None,
+    ) -> str:
+        """
+        Create (or no-op if already present) a sub-fixture market.
+        Document keys match Rust's SubFixtureMarket struct exactly.
+
+        Unlike Game.id (String, hand-set to match_id), SubFixtureMarket.id
+        is Option<ObjectId> -- so _id is deliberately NOT set here; Mongo
+        auto-generates a real ObjectId on insert, same as insert_one()
+        would do on the Rust side. market_id (a plain string, separate
+        from _id) is the actual business key SubFixtureBet.market_id
+        references -- generated here since nothing else assigns one.
+
+        See the class-level CALL DISCIPLINE note above before wiring this
+        into any caller other than the one-time fixture-creation branch.
+        """
+        market_id = f"{match_id}_{market_type}"
+        now = datetime.now(timezone.utc)
+
+        doc = {
+            "matchId": match_id,
+            "marketId": market_id,
+            "marketType": market_type,
+            "options": options,
+            "line": line,
+            "status": "open",
+            "lockAt": lock_at,
+            "pledgeCounts": {opt: 0 for opt in options},
+            "pledgeTotals": {opt: 0 for opt in options},
+            "result": None,
+            "isVisible": True,
+            "createdAt": now,
+            "updatedAt": now,
+            "settledAt": None,
+        }
+
+        self._collection.update_one(
+            {"matchId": match_id, "marketId": market_id},
+            {"$setOnInsert": doc},
+            upsert=True,
+        )
+        return market_id
+
+    def create_markets_bulk(
+        self,
+        match_id: str,
+        market_specs: List[Dict[str, Any]],
+    ) -> List[str]:
+        """
+        Create several markets for one match in one call, e.g.:
+            [
+                {"market_type": "first_goal", "options": ["home", "away"]},
+                {"market_type": "first_card", "options": ["home", "away"]},
+            ]
+        Returns the list of market_ids created (or already existing).
+        Same call-discipline caveat as create_market applies here.
+        """
+        return [
+            self.create_market(
+                match_id=match_id,
+                market_type=spec["market_type"],
+                options=spec["options"],
+                line=spec.get("line"),
+                lock_at=spec.get("lock_at"),
+            )
+            for spec in market_specs
+        ]
+
+    def get_market(self, match_id: str, market_id: str) -> Optional[Dict[str, Any]]:
+        """Get a single sub-fixture market."""
+        return self._collection.find_one({"matchId": match_id, "marketId": market_id})
+
+    def get_markets_for_match(self, match_id: str) -> List[Dict[str, Any]]:
+        """Get all visible sub-fixture markets for a match."""
+        return list(self._collection.find({"matchId": match_id, "isVisible": True}))
+
+    def set_result(self, match_id: str, market_id: str, result: Optional[str]) -> None:
+        """Record the settlement result on the market document itself
+        (separate from settling individual bets, which the Rust
+        /sub-fixture/settle endpoint already handles). upsert=False --
+        settling a market should never be able to create one out of thin
+        air, matching this file's zombie-doc-avoidance convention."""
+        self._collection.update_one(
+            {"matchId": match_id, "marketId": market_id},
+            {
+                "$set": {
+                    "status": "settled",
+                    "result": result,
+                    "settledAt": datetime.now(timezone.utc),
+                    "updatedAt": datetime.now(timezone.utc),
+                }
+            },
+            upsert=False,
+        )
+
+    def close(self) -> None:
+        """Close the MongoDB connection."""
+        self._client.close()
+
+
 def create_store(mongo_uri: str = None) -> FixtureStore:
     """Create a FixtureStore instance with optional URI."""
     import os
@@ -877,3 +1039,16 @@ def create_store(mongo_uri: str = None) -> FixtureStore:
     if not mongo_uri:
         raise ValueError("MONGO_URI environment variable is required")
     return FixtureStore(mongo_uri)
+
+
+def create_sub_fixture_store(mongo_uri: str = None) -> SubFixtureStore:
+    """Create a SubFixtureStore instance with optional URI. Reuses the
+    same MONGO_URI env var as create_store() -- same cluster, same
+    database (config.MONGO_DB), different collection."""
+    import os
+
+    if mongo_uri is None:
+        mongo_uri = os.environ.get("MONGO_URI")
+    if not mongo_uri:
+        raise ValueError("MONGO_URI environment variable is required")
+    return SubFixtureStore(mongo_uri)

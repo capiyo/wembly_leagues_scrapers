@@ -1,6 +1,7 @@
 """
 Forwards updates from poller to Rust backend API.
-ALL field names match Rust structs EXACTLY.
+Handles: fixtures, live updates, events, commentary, lineups, statistics,
+finalization, notifications, and sub-fixture markets.
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ class Forwarder:
     def __init__(self, api_url: str, timeout: int = 30, max_retries: int = 3):
         self.api_url = api_url.rstrip("/")
         self.timeout = timeout
+
+        # Create session with retry logic
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -29,6 +32,7 @@ class Forwarder:
             }
         )
 
+        # Retry strategy for transient failures
         retry_strategy = Retry(
             total=max_retries,
             backoff_factor=1,
@@ -40,35 +44,31 @@ class Forwarder:
         self.session.mount("https://", adapter)
 
     def _post(self, endpoint: str, data: Dict[str, Any]) -> bool:
+        """Generic POST request with error handling."""
         url = f"{self.api_url}{endpoint}"
         try:
             response = self.session.post(url, json=data, timeout=self.timeout)
             response.raise_for_status()
-            logger.info(f"✅ POST to {endpoint} successful")
             return True
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to POST to {endpoint}: {e}")
             if hasattr(e, "response") and e.response:
                 logger.error(f"Response: {e.response.text[:500]}")
-            import json
-
-            logger.error(f"Payload: {json.dumps(data, indent=2)[:1000]}")
             return False
 
     def _put(self, endpoint: str, data: Dict[str, Any]) -> bool:
+        """Generic PUT request with error handling."""
         url = f"{self.api_url}{endpoint}"
         try:
             response = self.session.put(url, json=data, timeout=self.timeout)
             response.raise_for_status()
-            logger.info(f"✅ PUT to {endpoint} successful")
             return True
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to PUT to {endpoint}: {e}")
-            if hasattr(e, "response") and e.response:
-                logger.error(f"Response: {e.response.text[:500]}")
             return False
 
     def _get(self, endpoint: str, params: Optional[Dict] = None) -> Optional[Dict]:
+        """Generic GET request with error handling."""
         url = f"{self.api_url}{endpoint}"
         try:
             response = self.session.get(url, params=params, timeout=self.timeout)
@@ -78,510 +78,434 @@ class Forwarder:
             logger.error(f"Failed to GET from {endpoint}: {e}")
             return None
 
-    def _format_timestamp(self, ts) -> str:
-        if ts is None:
-            return (
-                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-            )
-        if isinstance(ts, datetime):
-            return ts.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-        if isinstance(ts, str):
-            ts = ts.replace("+00:00", "Z")
-            if "." not in ts:
-                ts = ts.replace("Z", "").replace("+00:00", "")
-                ts = ts + ".000Z"
-            if not ts.endswith("Z") and "+" not in ts:
-                ts = ts + "Z"
-            return ts
-        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    # ============================================================
+    # FIXTURE MANAGEMENT
+    # ============================================================
 
-    def _clean(self, data: Dict) -> Dict:
-        return {k: v for k, v in data.items() if v is not None}
+    def forward_fixture(self, fixture: Dict[str, Any]) -> bool:
+        """
+        Forward a single fixture to the Rust API.
+        """
+        return self._post("/games", fixture)
+
+    def forward_fixtures_bulk(self, fixtures: List[Dict[str, Any]]) -> bool:
+        """
+        Forward multiple fixtures in bulk.
+        """
+        return self._post("/games/bulk", {"fixtures": fixtures})
 
     # ============================================================
     # LIVE UPDATES
     # ============================================================
+
     def forward_live_update(self, update: Dict[str, Any]) -> bool:
-        payload = self._clean(
-            {
-                "fixtureId": update.get("fixture_id"),
-                "eventType": update.get("event_type"),
-                "homeScore": int(update.get("home_score", 0)),
-                "awayScore": int(update.get("away_score", 0)),
-                "minute": int(update.get("minute", 0)),
-                "minuteDisplay": update.get("minute_display"),
-                "status": update.get("status"),
-                "isLive": update.get("is_live"),
-                "availableForVoting": update.get("available_for_voting"),
-                "scorer": update.get("scorer"),
-                "player": update.get("player"),
-                "assist": update.get("assist"),
-                "team": update.get("team"),
-                "timestamp": self._format_timestamp(update.get("timestamp")),
-            }
-        )
-        return self._post("/games/live-update", payload)
+        """
+        Forward a live match update to the Rust API.
 
-    # ============================================================
-    # COMMENTARY
-    # ============================================================
-    def _normalize_commentary_entry(self, entry: Dict[str, Any]) -> Dict[str, Any]:
-        try:
-            minute = int(entry.get("minute", 0))
-        except (ValueError, TypeError):
-            minute = 0
-
-        text = str(entry.get("text", ""))
-
-        event_type = entry.get("type")
-        if not event_type:
-            event_type = entry.get("event_type")
-        if not event_type:
-            event_type = "commentary"
-        event_type = str(event_type)
-
-        created_at = entry.get("createdAt")
-        if not created_at:
-            created_at = entry.get("created_at")
-        created_at = self._format_timestamp(created_at)
-
-        return self._clean(
-            {
-                "minute": minute,
-                "text": text,
-                "type": event_type,
-                "team": entry.get("team"),
-                "player": entry.get("player"),
-                "createdAt": created_at,
-            }
-        )
-
-    def forward_commentary(self, commentary: Dict[str, Any]) -> bool:
-        entry = commentary.get("entry", {})
-        match_id = commentary.get("match_id")
-        if not match_id:
-            logger.error("Missing match_id in commentary")
-            return False
-
-        payload = {
-            "match_id": str(match_id),
-            "entry": self._normalize_commentary_entry(entry),
+        Expected payload:
+        {
+            "fixture_id": "wc26_123",
+            "event_type": "live_update|score|status|goal|card|substitution",
+            "home_score": 1,
+            "away_score": 0,
+            "minute": 67,
+            "minute_display": "67'",
+            "status": "live|completed",
+            "is_live": true,
+            "available_for_voting": false,
+            "scorer": "home_team|away_team",
+            "player": "Player Name",
+            "assist": "Assist Name",
+            "team": "home|away"
         }
-        logger.debug(f"📤 Commentary payload: {payload}")
-        return self._post("/games/commentary", payload)
-
-    def forward_commentary_bulk(
-        self, fixture_id: str, entries: List[Dict[str, Any]]
-    ) -> bool:
-        if not fixture_id:
-            logger.error("Missing fixture_id in bulk commentary")
-            return False
-        if not entries:
-            return True
-
-        normalized = [self._normalize_commentary_entry(e) for e in entries]
-        payload = {
-            "match_id": str(fixture_id),
-            "entries": normalized,
-        }
-        logger.debug(
-            f"📤 Bulk commentary payload: {len(normalized)} entries for {fixture_id}"
-        )
-        return self._post("/games/commentary/bulk", payload)
-
-    # ============================================================
-    # STATISTICS
-    # ============================================================
-    def forward_statistics(self, statistics: Dict[str, Any]) -> bool:
-        stats = statistics.get("statistics", {})
-        payload = self._clean(
-            {
-                "fixture_id": statistics.get("fixture_id"),
-                "minute": int(statistics.get("minute", 0)),
-                "statistics": {
-                    "home": self._clean(stats.get("home", {})),
-                    "away": self._clean(stats.get("away", {})),
-                },
-            }
-        )
-        if payload.get("fixture_id") is None:
-            logger.error("Missing fixture_id in statistics")
-            return False
-        return self._post("/games/statistics", payload)
-
-    # ============================================================
-    # LINEUPS
-    # ============================================================
-    def forward_lineups(self, lineups: Dict[str, Any]) -> bool:
-        lineups_data = lineups.get("lineups", {})
-
-        def clean_player(member: Dict[str, Any]) -> Dict[str, Any]:
-            position = member.get("position")
-            position_name = (
-                position.get("name") or position.get("shortName")
-                if isinstance(position, dict)
-                else position
-            ) or ""
-            jersey_number = (
-                member.get("jerseyNumber")
-                or member.get("shirtNumber")
-                or member.get("num")
-                or 0
-            )
-            captain = bool(
-                member.get("captain")
-                or member.get("isCaptain")
-                or member.get("captainFlag")
-            )
-            player_id = member.get("id") or member.get("playerId")
-            return {
-                "name": member.get("name") or member.get("shortName") or "Unknown",
-                "position": position_name,
-                "jerseyNumber": jersey_number,
-                "captain": captain,
-                "lineup": "starting" if member.get("status") == 1 else "bench",
-                "playerId": str(player_id) if player_id is not None else None,
-            }
-
-        def clean_team(data):
-            members = data.get("players") or data.get("members") or []
-            starting = [clean_player(m) for m in members if m.get("status") == 1]
-            bench = [clean_player(m) for m in members if m.get("status") != 1]
-            bench.extend(clean_player(m) for m in data.get("bench", []))
-            return {
-                "formation": data.get("formation", "4-4-2"),
-                "coach": {"name": data.get("coach", {}).get("name", "Unknown")},
-                "players": starting,
-                "bench": bench,
-            }
-
-        payload = self._clean(
-            {
-                "fixtureId": lineups.get("fixture_id"),
-                "homeTeam": lineups.get("home_team"),
-                "awayTeam": lineups.get("away_team"),
-                "lineups": {
-                    "home": clean_team(lineups_data.get("home", {})),
-                    "away": clean_team(lineups_data.get("away", {})),
-                },
-            }
-        )
-        if payload.get("fixtureId") is None:
-            logger.error("Missing fixtureId in lineups")
-            return False
-        return self._post("/games/lineups", payload)
-
-    # ============================================================
-    # BET SETTLEMENT
-    # ============================================================
-    def settle_bets(self, fixture_id: str, result: str) -> bool:
         """
-        Settle all bets for a completed match.
+        # Add timestamp if not present
+        if "timestamp" not in update:
+            update["timestamp"] = datetime.now(timezone.utc).isoformat()
 
-        Args:
-            fixture_id: The match ID (e.g., "wc26_4627864")
-            result: "home", "away", or "draw"
-
-        Returns:
-            True if settlement succeeded, False otherwise
-        """
-        if result not in ["home", "away", "draw"]:
-            logger.error(f"Invalid result for settlement: {result}")
-            return False
-
-        payload = {
-            "fixture_id": fixture_id,
-            "result": result,
-        }
-        logger.info(f"💰 Settling bets for {fixture_id} with result: {result}")
-        return self._post("/actions/bet/settle", payload)
-
-    # ============================================================
-    # SUB-FIXTURE SETTLEMENT
-    # ============================================================
-
-    # One entry per sub-fixture market created for EVERY fixture the
-    # moment it's first scraped. Field names match SubFixtureMarket
-    # (models/sub_fixture.rs) exactly: market_id, market_type, options,
-    # line. Everything else on that struct (status, pledge_counts,
-    # pledge_totals, result, is_visible, created_at/updated_at/settled_at,
-    # the Mongo _id) is server-managed -- NOT sent here, since no
-    # CreateSubFixtureMarketRequest struct was provided to confirm what
-    # the creation endpoint actually accepts as input vs. what it fills
-    # in itself. is_visible is included as a reasonable default (true)
-    # in case the handler expects it as input rather than defaulting it.
-    #
-    # market_type values ("first_event" / "over_under") are GUESSES --
-    # unconfirmed against sub_fixture_handler.rs. Adjust if the Rust
-    # side uses different strings.
-    SUB_FIXTURE_MARKET_DEFS = [
-        {
-            "market_id": "first_goal",
-            "market_type": "first_event",
-            "options": ["home", "away"],
-            "line": None,
-        },
-        {
-            "market_id": "first_card",
-            "market_type": "first_event",
-            "options": ["home", "away"],
-            "line": None,
-        },
-        {
-            "market_id": "first_corner",
-            "market_type": "first_event",
-            "options": ["home", "away"],
-            "line": None,
-        },
-        {
-            "market_id": "over_under_2_5",
-            "market_type": "over_under",
-            "options": ["over", "under"],
-            "line": 2.5,
-        },
-    ]
-
-    def create_sub_fixture_markets(self, match_id: str) -> bool:
-        """
-        Create the standard set of sub-fixture markets (first_goal,
-        first_card, first_corner, over_under_2_5) for a fixture, right
-        when it's first scraped -- see leagues_scraper.py's _upsert_games,
-        gated on FixtureStore.upsert_fixture()'s return value so this
-        only ever fires once per fixture, not on every re-scrape.
-
-        ASSUMPTION (UNCONFIRMED): endpoint path guessed by mirroring
-        settle_sub_fixture_market()'s "/sub_fixtures/sub-fixture/settle"
-        naming -- "/sub_fixtures/sub-fixture/create". No
-        CreateSubFixtureMarketRequest struct was available to confirm
-        this path or its exact expected body shape. Verify against
-        sub_fixture_handler.rs / sub_fixture_routes.rs and adjust the
-        endpoint string and/or payload fields below if it's mounted or
-        shaped differently.
-
-        Posts each market individually (mirroring settle_sub_fixture_
-        market's one-call-per-market pattern) rather than a single bulk
-        call, since no bulk-create request shape was confirmed either.
-
-        Returns:
-            True only if every market was created successfully. Logs
-            each failure individually so a partial failure is visible in
-            logs even though the caller doesn't retry per-market -- the
-            whole fixture will simply be missing whichever markets
-            failed until this is manually fixed or the scraper is
-            adjusted to retry per-market.
-        """
-        all_ok = True
-        for market_def in self.SUB_FIXTURE_MARKET_DEFS:
-            payload = self._clean(
-                {
-                    "match_id": match_id,
-                    "market_id": market_def["market_id"],
-                    "market_type": market_def["market_type"],
-                    "options": market_def["options"],
-                    "line": market_def["line"],
-                    "is_visible": True,
-                }
-            )
-            logger.info(
-                f"🆕 Creating sub-fixture market {market_def['market_id']} for {match_id}"
-            )
-            success = self._post("/sub_fixtures/sub-fixture/create", payload)
-            if not success:
-                all_ok = False
-                logger.warning(
-                    f"⚠️ Failed to create sub-fixture market {market_def['market_id']} for {match_id}"
-                )
-        return all_ok
-
-    def settle_sub_fixture_market(
-        self, match_id: str, market_id: str, winning_team: Optional[str]
-    ) -> bool:
-        """
-        Settle a sub-fixture market (first_goal, first_card, first_corner,
-        over_under_2_5, etc.) once its outcome is known.
-
-        This is a DIFFERENT system from settle_bets() above: settle_bets
-        settles the main match-winner pool via /actions/bet/settle,
-        against the `bets` collection. This hits the new route added to
-        sub_fixture_handler.rs / sub_fixture_routes.rs (settle_sub_fixture_
-        market_handler), which settles the `sub_fixture_bets` collection.
-
-        ASSUMPTION (UNCONFIRMED): the routes are nested as
-        "/api/sub_fixtures" + "/sub-fixture/settle" in main.rs, and
-        self.api_url already ends in "/api" (it does by default --
-        see FANCLASH_API). That makes the path relative to api_url
-        "/sub_fixtures/sub-fixture/settle". Verify against your actual
-        main.rs nesting and adjust the endpoint string below if it's
-        mounted differently.
-
-        Args:
-            match_id: The match ID (matches SubFixtureBet.match_id)
-            market_id: The sub-fixture market id, e.g. "first_goal"
-            winning_team: "home", "away", "over", "under", or None for
-                a draw/no-winner (Rust side refunds both parties)
-        """
-        payload = self._clean(
-            {
-                "match_id": match_id,
-                "market_id": market_id,
-                "winning_team": winning_team,
-            }
-        )
-        logger.info(
-            f"🏁 Settling sub-fixture {market_id} for {match_id} -> {winning_team}"
-        )
-        return self._post("/sub_fixtures/sub-fixture/settle", payload)
-
-    # ============================================================
-    # HISTORY / ARCHIVE
-    # ============================================================
-    def move_to_history(self, fixture_id: str) -> bool:
-        """Move a completed match to history."""
-        if not fixture_id:
-            logger.error("Missing fixture_id for move_to_history")
-            return False
-        return self._post(f"/games/{fixture_id}/move-to-history", {})
-
-    # ============================================================
-    # OTHER METHODS
-    # ============================================================
-    def forward_fixture(self, fixture: Dict[str, Any]) -> bool:
-        return self._post("/games", fixture)
-
-    def forward_fixtures_bulk(self, fixtures: List[Dict[str, Any]]) -> bool:
-        return self._post("/games/bulk", {"fixtures": fixtures})
+        return self._post("/games/live-update", update)
 
     def forward_score_update(
         self, match_id: str, home_score: int, away_score: int, minute: int
     ) -> bool:
+        """
+        Forward a score update.
+        """
         payload = {
-            "matchId": match_id,
-            "homeScore": int(home_score),
-            "awayScore": int(away_score),
-            "timeElapsed": int(minute),
+            "fixture_id": match_id,
+            "event_type": "score",
+            "home_score": home_score,
+            "away_score": away_score,
+            "minute": minute,
         }
-        return self._put(f"/games/{match_id}/score", payload)
+        return self._post("/games/score", payload)
 
     def forward_status_update(
         self, match_id: str, status: str, is_live: bool, available_for_voting: bool
     ) -> bool:
+        """
+        Forward a status update.
+        """
         payload = {
-            "matchId": match_id,
+            "fixture_id": match_id,
             "status": status,
-            "isLive": is_live,
-            "availableForVoting": available_for_voting,
+            "is_live": is_live,
+            "available_for_voting": available_for_voting,
         }
-        return self._put(f"/games/{match_id}/status", payload)
+        return self._post("/games/status", payload)
+
+    # ============================================================
+    # EVENTS (Goals, Cards, Substitutions)
+    # ============================================================
 
     def forward_event(self, event: Dict[str, Any]) -> bool:
-        payload = self._clean(
-            {
-                "fixtureId": event.get("fixture_id"),
-                "eventType": event.get("event_type"),
-                "minute": int(event.get("minute", 0)),
-                "team": event.get("team"),
-                "player": event.get("player"),
-                "assist": event.get("assist"),
-                "homeScore": int(event.get("home_score", 0)),
-                "awayScore": int(event.get("away_score", 0)),
-            }
-        )
-        return self._post("/games/events", payload)
+        """
+        Forward a single event to the Rust API.
 
-    def forward_match_events_bulk(
+        Expected payload:
+        {
+            "fixture_id": "wc26_123",
+            "event_type": "goal|yellow_card|red_card|substitution|penalty|own_goal",
+            "minute": 23,
+            "team": "home|away",
+            "player": "Player Name",
+            "assist": "Assist Name (optional)",
+            "home_score": 1,
+            "away_score": 0,
+        }
+        """
+        return self._post("/games/events", event)
+
+    def forward_bulk_events(self, bulk: Dict[str, Any]) -> bool:
+        """
+        Forward multiple events at once.
+
+        Expected payload:
+        {
+            "fixture_id": "wc26_123",
+            "events": [
+                {
+                    "event_type": "goal",
+                    "minute": 23,
+                    "team": "home",
+                    "player": "Player Name",
+                    ...
+                }
+            ]
+        }
+        """
+        return self._post("/games/events/bulk", bulk)
+
+    def forward_event_batch(
         self, fixture_id: str, events: List[Dict[str, Any]]
     ) -> bool:
-        """Discrete goal/card/corner events for sub-fixture settlement --
-        distinct from forward_event() above, which is a single-event
-        notification-shaped call (carries homeScore/awayScore/assist for
-        a goal_scored-style push). This one is a plain bulk list matching
-        MatchEventsBulkRequest/MatchEventPayload on the Rust side:
-        {fixture_id, events: [{event_type, minute, team, player}, ...]}.
         """
-        if not fixture_id:
-            logger.error("Missing fixture_id in bulk match events")
-            return False
-        if not events:
-            return True
+        Forward a batch of events for a fixture.
+        """
+        return self._post(f"/games/{fixture_id}/events/batch", {"events": events})
 
-        normalized = [
-            self._clean(
-                {
-                    "event_type": e.get("event_type"),
-                    "minute": int(e.get("minute", 0)),
-                    "team": e.get("team"),
-                    "player": e.get("player"),
-                }
-            )
-            for e in events
-        ]
+    # ============================================================
+    # COMMENTARY
+    # ============================================================
 
-        payload = {
-            "fixture_id": str(fixture_id),
-            "events": normalized,
-        }
-        logger.debug(
-            f"📤 Bulk match events payload: {len(normalized)} events for {fixture_id}"
-        )
-        return self._post("/games/events/bulk", payload)
+    def forward_commentary(self, commentary: Dict[str, Any]) -> bool:
+        """
+        Forward commentary to the Rust API.
 
-    def forward_notification(self, notification: Dict[str, Any]) -> bool:
-        payload = self._clean(
-            {
-                "fixtureId": notification.get("fixtureId")
-                or notification.get("fixture_id"),
-                "eventType": notification.get("eventType")
-                or notification.get("event_type"),
-                "title": notification.get("title"),
-                "body": notification.get("body"),
-                "data": notification.get("data"),
+        Expected payload:
+        {
+            "match_id": "wc26_123",
+            "entry": {
+                "minute": 23,
+                "text": "Great goal by Player!",
+                "type": "goal|chance|card|substitution|general",
+                "team": "home|away",
+                "player": "Player Name",
+                "created_at": "2026-06-27T15:00:00Z"
             }
-        )
-        return self._post("/games/notify", payload)
-
-    def forward_match_result(
-        self, fixture_id: str, result: str, home_score: int, away_score: int
-    ) -> bool:
-        payload = {
-            "fixtureId": fixture_id,
-            "result": result,
-            "homeScore": int(home_score),
-            "awayScore": int(away_score),
         }
-        return self._post("/games/result", payload)
+        """
+        return self._post("/games/commentary", commentary)
+
+    def forward_commentary_bulk(
+        self, fixture_id: str, entries: List[Dict[str, Any]]
+    ) -> bool:
+        """
+        Forward multiple commentary entries for a fixture.
+        """
+        payload = {"match_id": fixture_id, "entries": entries}
+        return self._post("/games/commentary/bulk", payload)
+
+    # ============================================================
+    # LINEUPS
+    # ============================================================
+
+    def forward_lineups(self, lineups: Dict[str, Any]) -> bool:
+        """
+        Forward lineups to the Rust API.
+
+        Expected payload:
+        {
+            "fixture_id": "wc26_123",
+            "home_team": "Team A",
+            "away_team": "Team B",
+            "lineups": {
+                "home": {
+                    "formation": "4-3-3",
+                    "coach": {"name": "Coach Name"},
+                    "players": [
+                        {
+                            "name": "Player",
+                            "position": "GK",
+                            "jersey_number": 1,
+                            "captain": false,
+                            "lineup": "starting|bench",
+                            "player_id": "123"
+                        }
+                    ],
+                    "bench": [...]
+                },
+                "away": {...}
+            }
+        }
+        """
+        return self._post("/games/lineups", lineups)
 
     def forward_lineups_simplified(
         self, fixture_id: str, home_players: List[Dict], away_players: List[Dict]
     ) -> bool:
+        """
+        Forward simplified lineups (just starting XI).
+        """
         payload = {
-            "fixtureId": fixture_id,
+            "fixture_id": fixture_id,
             "home": home_players,
             "away": away_players,
         }
         return self._post("/games/lineups/simplified", payload)
 
+    # ============================================================
+    # STATISTICS
+    # ============================================================
+
+    def forward_statistics(self, statistics: Dict[str, Any]) -> bool:
+        """
+        Forward match statistics to the Rust API.
+
+        Expected payload:
+        {
+            "fixture_id": "wc26_123",
+            "statistics": {
+                "home": {
+                    "possession": 55,
+                    "shots": 12,
+                    "shots_on_target": 5,
+                    "shots_off_target": 4,
+                    "corners": 6,
+                    "fouls": 10,
+                    "yellow_cards": 2,
+                    "red_cards": 0,
+                    "offsides": 1,
+                    "passes": 450,
+                    "pass_accuracy": 78,
+                },
+                "away": {
+                    "possession": 45,
+                    "shots": 8,
+                    "shots_on_target": 3,
+                    ...
+                }
+            },
+            "minute": 67
+        }
+        """
+        return self._post("/games/statistics", statistics)
+
     def forward_statistics_bulk(self, stats_bulk: Dict[str, Any]) -> bool:
+        """
+        Forward multiple statistics snapshots at once.
+
+        Expected payload:
+        {
+            "fixture_id": "wc26_123",
+            "snapshots": [
+                {
+                    "minute": 15,
+                    "statistics": {...}
+                },
+                {
+                    "minute": 30,
+                    "statistics": {...}
+                }
+            ]
+        }
+        """
         return self._post("/games/statistics/bulk", stats_bulk)
 
     def forward_statistics_snapshot(
         self, fixture_id: str, minute: int, stats: Dict[str, Any]
     ) -> bool:
+        """
+        Forward a single statistics snapshot.
+        """
         payload = {
             "fixture_id": fixture_id,
-            "minute": int(minute),
-            "statistics": {
-                "home": self._clean(stats.get("home", {})),
-                "away": self._clean(stats.get("away", {})),
-            },
+            "minute": minute,
+            "statistics": stats,
         }
         return self._post("/games/statistics/snapshot", payload)
+
+    # ============================================================
+    # MATCH FINALIZATION
+    # ============================================================
+
+    def finalize_match(self, finalize_data: Dict[str, Any]) -> bool:
+        """
+        Finalize match result.
+
+        Expected payload:
+        {
+            "fixture_id": "wc26_123",
+            "result": "home|away|draw",
+            "home_score": 2,
+            "away_score": 1,
+            "winner": "home_team|away_team|none",
+            "status": "completed",
+        }
+        """
+        return self._post("/games/finalize", finalize_data)
+
+    def forward_match_result(
+        self, fixture_id: str, result: str, home_score: int, away_score: int
+    ) -> bool:
+        """
+        Forward just the match result.
+        """
+        payload = {
+            "fixture_id": fixture_id,
+            "result": result,
+            "home_score": home_score,
+            "away_score": away_score,
+        }
+        return self._post("/games/result", payload)
+
+    def move_to_history(self, fixture_id: str) -> bool:
+        """
+        Move a completed match to history.
+        """
+        return self._post(f"/games/{fixture_id}/move-to-history", {})
+
+    # ============================================================
+    # SUB-FIXTURE MARKETS (first_goal / first_card / first_corner /
+    # over_under_2_5 props)
+    # ============================================================
+    # Hits the Rust /sub_fixtures/sub-fixture/market/create route
+    # (create_sub_fixture_market_handler in sub_fixture_handler.rs), which
+    # is idempotent server-side (checks for an existing matchId+marketId
+    # doc before inserting) -- same guarantee mongo_store.py's
+    # SubFixtureStore.create_market() would have given via $setOnInsert,
+    # just reached over HTTP through the Rust API instead of a direct
+    # Mongo write from Python.
+
+    def create_sub_fixture_market(
+        self,
+        match_id: str,
+        market_type: str,  # "first_goal" | "first_card" | "first_corner" | "over_under_2_5"
+        options: List[str],  # e.g. ["home", "away"] or ["over", "under"]
+        line: Optional[float] = None,
+        lock_at: Optional[str] = None,  # RFC3339 string if provided
+    ) -> bool:
+        """
+        Create a single sub-fixture market for a fixture. Returns False
+        (and logs the response body) on any non-2xx response, same as
+        every other forward_* method here -- callers should treat a
+        False return as "did not get created, don't assume it exists."
+        """
+        payload = {
+            "match_id": match_id,
+            "market_type": market_type,
+            "options": options,
+            "line": line,
+            "lock_at": lock_at,
+        }
+        return self._post("/sub_fixtures/sub-fixture/market/create", payload)
+
+    def create_sub_fixture_markets(self, match_id: str) -> bool:
+        """
+        Create the standard set of sub-fixture markets for a newly
+        created fixture: first_goal, first_card, first_corner, and
+        over_under_2_5. Called exactly once per fixture -- from
+        leagues_scraper.py's _upsert_games, gated on upsert_fixture(...)
+        returning True (is_new) -- never on later re-scrapes of a fixture
+        that already exists, so a match never accumulates duplicate
+        markets from repeated scrape triggers.
+
+        Returns True only if every market was created successfully. On
+        partial failure, whichever markets DID succeed are left in place
+        (they're idempotent to retry, but this method itself is not
+        re-invoked automatically -- see the is_new-gated call site's
+        warning log).
+        """
+        markets = [
+            {"market_type": "first_goal", "options": ["home", "away"]},
+            {"market_type": "first_card", "options": ["home", "away"]},
+            {"market_type": "first_corner", "options": ["home", "away"]},
+            {
+                "market_type": "over_under_2_5",
+                "options": ["over", "under"],
+                "line": 2.5,
+            },
+        ]
+
+        all_ok = True
+        for m in markets:
+            ok = self.create_sub_fixture_market(
+                match_id=match_id,
+                market_type=m["market_type"],
+                options=m["options"],
+                line=m.get("line"),
+            )
+            if not ok:
+                logger.error(
+                    f"Failed to create sub-fixture market '{m['market_type']}' "
+                    f"for {match_id}"
+                )
+                all_ok = False
+
+        return all_ok
+
+    # ============================================================
+    # NOTIFICATIONS
+    # ============================================================
+
+    def forward_notification(self, notification: Dict[str, Any]) -> bool:
+        """
+        Forward a notification to the Rust API.
+
+        Expected payload:
+        {
+            "fixture_id": "wc26_123",
+            "event_type": "match_live|lineups_available|goal_scored|match_ended",
+            "title": "⚽ Match is LIVE!",
+            "body": "Team A vs Team B is now live!",
+            "data": {
+                "home_team": "Team A",
+                "away_team": "Team B",
+                "score": "1-0"
+            }
+        }
+        """
+        return self._post("/games/notify", notification)
 
     def forward_lineups_available_notification(
         self, fixture_id: str, home_team: str, away_team: str
     ) -> bool:
+        """
+        Send notification that lineups are available.
+        """
         payload = {
-            "fixtureId": fixture_id,
-            "eventType": "lineups_available",
+            "fixture_id": fixture_id,
+            "event_type": "lineups_available",
             "title": f"📋 Lineups are out! {home_team} vs {away_team}",
             "body": f"Check the starting XI for {home_team} vs {away_team}.",
             "data": {
@@ -595,11 +519,14 @@ class Forwarder:
     def forward_match_live_notification(
         self, fixture_id: str, home_team: str, away_team: str
     ) -> bool:
+        """
+        Send notification that match is live.
+        """
         payload = {
-            "fixtureId": fixture_id,
-            "eventType": "match_live",
+            "fixture_id": fixture_id,
+            "event_type": "match_live",
             "title": f"⚽ {home_team} vs {away_team} is LIVE!",
-            "body": "Match is now live. Follow the action!",
+            "body": f"The match has kicked off! Follow the action.",
             "data": {
                 "home_team": home_team,
                 "away_team": away_team,
@@ -616,9 +543,12 @@ class Forwarder:
         home_score: int,
         away_score: int,
     ) -> bool:
+        """
+        Send notification that a goal was scored.
+        """
         payload = {
-            "fixtureId": fixture_id,
-            "eventType": "goal_scored",
+            "fixture_id": fixture_id,
+            "event_type": "goal_scored",
             "title": f"⚽ GOAL! {scorer} scores!",
             "body": f"{scorer} scores at {minute}'! Score: {home_score}-{away_score}",
             "data": {
@@ -634,9 +564,12 @@ class Forwarder:
     def forward_match_ended_notification(
         self, fixture_id: str, home_team: str, away_team: str, result: str
     ) -> bool:
+        """
+        Send notification that match has ended.
+        """
         payload = {
-            "fixtureId": fixture_id,
-            "eventType": "match_ended",
+            "fixture_id": fixture_id,
+            "event_type": "match_ended",
             "title": f"🏁 Full Time: {home_team} vs {away_team}",
             "body": f"Match ended. Result: {result}",
             "data": {
@@ -651,34 +584,79 @@ class Forwarder:
     # ============================================================
     # GAME MANAGEMENT
     # ============================================================
+
     def get_game(self, match_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a game by match_id from the Rust API.
+        """
         return self._get(f"/games/match/{match_id}")
 
     def get_live_games(self) -> Optional[List[Dict[str, Any]]]:
+        """
+        Get all live games from the Rust API.
+        """
         return self._get("/games/live")
 
     def get_upcoming_games(self) -> Optional[List[Dict[str, Any]]]:
+        """
+        Get all upcoming games from the Rust API.
+        """
         return self._get("/games/upcoming")
 
     def get_history_games(
         self, limit: int = 50, skip: int = 0
     ) -> Optional[List[Dict[str, Any]]]:
+        """
+        Get history games from the Rust API.
+        """
         return self._get("/games/history", {"limit": limit, "skip": skip})
 
+    # ============================================================
+    # BULK SYNC
+    # ============================================================
+
     def sync_fixtures(self, fixtures: List[Dict[str, Any]]) -> bool:
+        """
+        Sync all fixtures at once (full update).
+        """
         return self._post("/games/sync", {"fixtures": fixtures})
 
     def sync_live_data(self, live_data: Dict[str, Any]) -> bool:
+        """
+        Sync live data for multiple matches at once.
+
+        Expected payload:
+        {
+            "timestamp": "2026-06-27T15:00:00Z",
+            "matches": [
+                {
+                    "fixture_id": "wc26_123",
+                    "home_score": 1,
+                    "away_score": 0,
+                    "status": "live",
+                    "events": [...],
+                    "statistics": {...}
+                }
+            ]
+        }
+        """
         return self._post("/games/sync/live", live_data)
 
     # ============================================================
     # HEALTH CHECK
     # ============================================================
+
     def health_check(self) -> bool:
+        """
+        Check if the Rust API is healthy.
+        """
         result = self._get("/health")
         return result is not None and result.get("status") == "healthy"
 
     def ping(self) -> bool:
+        """
+        Simple ping to check API availability.
+        """
         try:
             response = self.session.get(f"{self.api_url}/ping", timeout=5)
             return response.status_code == 200
@@ -686,7 +664,15 @@ class Forwarder:
             return False
 
 
+# ============================================================
+# FACTORY FUNCTION
+# ============================================================
+
+
 def create_forwarder(api_url: str = None, **kwargs) -> Forwarder:
+    """
+    Create a Forwarder instance with optional configuration.
+    """
     import os
 
     if api_url is None:
