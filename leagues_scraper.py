@@ -38,6 +38,7 @@ Usage:
     python leagues_scraper.py --league epl --window
     python leagues_scraper.py --league all --window --days-ahead 7
 """
+
 from __future__ import annotations
 
 import argparse
@@ -51,6 +52,7 @@ from typing import Optional
 from dotenv import load_dotenv
 
 from mongo_store import FixtureStore
+from forwarder import Forwarder, create_forwarder
 from sources import threesixtyfive
 import config
 
@@ -68,7 +70,14 @@ def _status_to_internal(status_text: str) -> str:
     if text in ("finished", "ft", "ended", "full-time", "aet", "pen"):
         return "completed"
 
-    live_patterns = (r"\blive\b", r"\b1st half\b", r"\b2nd half\b", r"\bht\b", r"\bhalftime\b", r"\bin progress\b")
+    live_patterns = (
+        r"\blive\b",
+        r"\b1st half\b",
+        r"\b2nd half\b",
+        r"\bht\b",
+        r"\bhalftime\b",
+        r"\bin progress\b",
+    )
     if any(re.search(pattern, text) for pattern in live_patterns):
         return "live"
 
@@ -83,11 +92,16 @@ def _is_qualifying_round(game: dict, fallback_league_name: str) -> bool:
     competitionDisplayName first (most reliable), falling back to the
     configured league name and roundName in case a feed doesn't put the
     qualifier marker in the competition name itself."""
-    text = " ".join(filter(None, [
-        game.get("competitionDisplayName"),
-        fallback_league_name,
-        game.get("roundName"),
-    ])).lower()
+    text = " ".join(
+        filter(
+            None,
+            [
+                game.get("competitionDisplayName"),
+                fallback_league_name,
+                game.get("roundName"),
+            ],
+        )
+    ).lower()
     return "qualif" in text or "preliminary" in text
 
 
@@ -101,7 +115,12 @@ def _parse_kickoff(start_time_raw: Optional[str]) -> datetime.datetime:
         return now
 
 
-def _upsert_games(store: FixtureStore, games: list[dict], league_key: str) -> int:
+def _upsert_games(
+    store: FixtureStore,
+    games: list[dict],
+    league_key: str,
+    forwarder: Optional[Forwarder] = None,
+) -> int:
     """Upsert a list of raw 365Scores game dicts for one league into the
     games collection, tagging each with leagueKey/roundNum/roundName so
     they can be queried back out by round later."""
@@ -122,7 +141,7 @@ def _upsert_games(store: FixtureStore, games: list[dict], league_key: str) -> in
         status = _status_to_internal(game.get("statusText", ""))
         match_id = f"{prefix}_{game_id}"
 
-        store.upsert_fixture(
+        is_new = store.upsert_fixture(
             match_id=match_id,
             threesixtyfive_game_id=game_id,
             home_team=home_team,
@@ -143,57 +162,96 @@ def _upsert_games(store: FixtureStore, games: list[dict], league_key: str) -> in
         upserted += 1
         logger.info(
             "Upserted %s: %s vs %s [%s] round=%s kickoff=%s (%s)",
-            match_id, home_team, away_team, status,
-            game.get("roundNum"), kickoff.strftime("%Y-%m-%d %H:%M"), comp_name,
+            match_id,
+            home_team,
+            away_team,
+            status,
+            game.get("roundNum"),
+            kickoff.strftime("%Y-%m-%d %H:%M"),
+            comp_name,
         )
+
+        # Sub-fixture markets (first_goal, first_card, first_corner,
+        # over_under_2_5) only ever get created here, the moment a
+        # fixture is FIRST inserted -- never on later re-scrapes of an
+        # already-existing fixture, so a match never ends up with
+        # duplicate markets from repeated scrape triggers.
+        if is_new and forwarder is not None:
+            created_ok = forwarder.create_sub_fixture_markets(match_id)
+            if not created_ok:
+                logger.warning(
+                    f"⚠️ {match_id}: one or more sub-fixture markets failed to create "
+                    f"(see forwarder logs above) -- will NOT be retried automatically, "
+                    f"since is_new only fires once per fixture"
+                )
 
     return upserted
 
 
-def scrape_league_fixtures(store: FixtureStore, league_key: str) -> int:
+def scrape_league_fixtures(
+    store: FixtureStore, league_key: str, forwarder: Optional[Forwarder] = None
+) -> int:
     """Fetch and upsert ALL fixtures 365Scores returns for one league."""
     if league_key not in config.LEAGUES:
-        raise ValueError(f"Unknown league key: {league_key!r}. Known: {list(config.LEAGUES)}")
+        raise ValueError(
+            f"Unknown league key: {league_key!r}. Known: {list(config.LEAGUES)}"
+        )
 
     league_cfg = config.LEAGUES[league_key]
     competition_id = league_cfg["competition_id"]
 
     logger.info(
         "Fetching %s fixtures from 365Scores (competitionId=%s) ...",
-        league_cfg["name"], competition_id,
+        league_cfg["name"],
+        competition_id,
     )
     games = threesixtyfive.fetch_games_by_competition([competition_id])
 
     if games is None:
-        logger.error("fetch_games_by_competition(%s) returned None -- network/API error", competition_id)
+        logger.error(
+            "fetch_games_by_competition(%s) returned None -- network/API error",
+            competition_id,
+        )
         return 0
 
-    logger.info("365Scores returned %d raw games for %s", len(games), league_cfg["name"])
+    logger.info(
+        "365Scores returned %d raw games for %s", len(games), league_cfg["name"]
+    )
 
     if not games:
         logger.warning(
             "0 games returned for %s (competitionId=%s) -- the id may be stale, "
             "re-derive it from the league's 365scores.com URL slug.",
-            league_cfg["name"], competition_id,
+            league_cfg["name"],
+            competition_id,
         )
         return 0
 
-    return _upsert_games(store, games, league_key)
+    return _upsert_games(store, games, league_key, forwarder=forwarder)
 
 
-def scrape_all_leagues(store: FixtureStore) -> dict[str, int]:
+def scrape_all_leagues(
+    store: FixtureStore, forwarder: Optional[Forwarder] = None
+) -> dict[str, int]:
     """Scrape every league in config.LEAGUES. Returns {league_key: count}."""
     results: dict[str, int] = {}
     for league_key in config.LEAGUES:
         try:
-            results[league_key] = scrape_league_fixtures(store, league_key)
+            results[league_key] = scrape_league_fixtures(
+                store, league_key, forwarder=forwarder
+            )
         except Exception as exc:
             logger.error("Scrape failed for league=%s: %s", league_key, exc)
             results[league_key] = 0
     return results
 
 
-def scrape_one_round(store: FixtureStore, league_key: str, round_num: Optional[int] = None) -> int:
+def scrape_one_round(
+    store: FixtureStore,
+    league_key: str,
+    round_num: Optional[int] = None,
+    forwarder: Optional[Forwarder] = None,
+) -> int:
     """Fetch a league's fixtures and upsert only ONE round of them.
 
     If round_num is None, picks the "current" round automatically: the
@@ -202,21 +260,25 @@ def scrape_one_round(store: FixtureStore, league_key: str, round_num: Optional[i
     is simply Round 1 / the opening round).
     """
     if league_key not in config.LEAGUES:
-        raise ValueError(f"Unknown league key: {league_key!r}. Known: {list(config.LEAGUES)}")
+        raise ValueError(
+            f"Unknown league key: {league_key!r}. Known: {list(config.LEAGUES)}"
+        )
 
     league_cfg = config.LEAGUES[league_key]
     competition_id = league_cfg["competition_id"]
 
     logger.info(
         "Fetching %s fixtures from 365Scores (competitionId=%s) to find one round ...",
-        league_cfg["name"], competition_id,
+        league_cfg["name"],
+        competition_id,
     )
     games = threesixtyfive.fetch_games_by_competition([competition_id])
 
     if not games:
         logger.warning(
             "0 games returned for %s (competitionId=%s) -- cannot determine round.",
-            league_cfg["name"], competition_id,
+            league_cfg["name"],
+            competition_id,
         )
         return 0
 
@@ -226,32 +288,44 @@ def scrape_one_round(store: FixtureStore, league_key: str, round_num: Optional[i
         pool = not_finished or games
         round_nums = [g.get("roundNum") for g in pool if g.get("roundNum") is not None]
         if not round_nums:
-            logger.warning("No roundNum field present on any fetched game for %s.", league_cfg["name"])
+            logger.warning(
+                "No roundNum field present on any fetched game for %s.",
+                league_cfg["name"],
+            )
             return 0
         round_num = min(round_nums)
-        logger.info("Auto-selected round %s for %s (earliest unplayed round).", round_num, league_cfg["name"])
+        logger.info(
+            "Auto-selected round %s for %s (earliest unplayed round).",
+            round_num,
+            league_cfg["name"],
+        )
 
     round_games = [g for g in games if g.get("roundNum") == round_num]
     logger.info(
         "%d/%d games belong to round %s for %s",
-        len(round_games), len(games), round_num, league_cfg["name"],
+        len(round_games),
+        len(games),
+        round_num,
+        league_cfg["name"],
     )
 
     if not round_games:
         return 0
 
-    return _upsert_games(store, round_games, league_key)
+    return _upsert_games(store, round_games, league_key, forwarder=forwarder)
 
 
 # ============================================================
 # ROLLING WINDOW SCRAPE (used automatically by poller.py)
 # ============================================================
 
+
 def scrape_league_fixtures_window(
     store: FixtureStore,
     league_key: str,
     days_ahead: int = 7,
     reference_override: Optional[datetime.datetime] = None,
+    forwarder: Optional[Forwarder] = None,
 ) -> int:
     """Fetch a league's fixtures and upsert only the ones landing in the
     next `days_ahead` days (plus anything already in progress). This is
@@ -274,27 +348,35 @@ def scrape_league_fixtures_window(
     guessing its own anchor independently.
     """
     if league_key not in config.LEAGUES:
-        raise ValueError(f"Unknown league key: {league_key!r}. Known: {list(config.LEAGUES)}")
+        raise ValueError(
+            f"Unknown league key: {league_key!r}. Known: {list(config.LEAGUES)}"
+        )
 
     league_cfg = config.LEAGUES[league_key]
     competition_id = league_cfg["competition_id"]
 
     logger.info(
         "Fetching %s fixtures from 365Scores (competitionId=%s) for %d-day window ...",
-        league_cfg["name"], competition_id, days_ahead,
+        league_cfg["name"],
+        competition_id,
+        days_ahead,
     )
 
     games = threesixtyfive.fetch_games_by_competition([competition_id])
 
     if games is None:
-        logger.error("fetch_games_by_competition(%s) returned None -- network/API error", competition_id)
+        logger.error(
+            "fetch_games_by_competition(%s) returned None -- network/API error",
+            competition_id,
+        )
         return 0
 
     if not games:
         logger.warning(
             "0 games returned for %s (competitionId=%s) -- either the id is "
             "stale or the season hasn't been scheduled by 365Scores yet.",
-            league_cfg["name"], competition_id,
+            league_cfg["name"],
+            competition_id,
         )
         return 0
 
@@ -304,7 +386,8 @@ def scrape_league_fixtures_window(
         reference = reference_override
         logger.info(
             "%s: using shared reference date %s (override, not the per-league heuristic)",
-            league_cfg["name"], reference.strftime("%Y-%m-%d"),
+            league_cfg["name"],
+            reference.strftime("%Y-%m-%d"),
         )
     else:
         # Reference point for the window -- NOT always "today". Two cases
@@ -331,7 +414,8 @@ def scrape_league_fixtures_window(
             reference = last_kickoff
             logger.info(
                 "%s: continuing rolling window from last-scraped kickoff %s (not today)",
-                league_cfg["name"], reference.strftime("%Y-%m-%d %H:%M"),
+                league_cfg["name"],
+                reference.strftime("%Y-%m-%d %H:%M"),
             )
         else:
             not_finished = [g for g in games if not threesixtyfive.is_game_finished(g)]
@@ -339,11 +423,14 @@ def scrape_league_fixtures_window(
                 (_parse_kickoff(g.get("startTime")) for g in not_finished),
                 default=None,
             )
-            if earliest_kickoff and earliest_kickoff > now + datetime.timedelta(days=days_ahead):
+            if earliest_kickoff and earliest_kickoff > now + datetime.timedelta(
+                days=days_ahead
+            ):
                 reference = earliest_kickoff
                 logger.info(
                     "%s hasn't started yet -- anchoring window on season start %s instead of today",
-                    league_cfg["name"], reference.strftime("%Y-%m-%d %H:%M"),
+                    league_cfg["name"],
+                    reference.strftime("%Y-%m-%d %H:%M"),
                 )
             else:
                 reference = now
@@ -392,24 +479,34 @@ def scrape_league_fixtures_window(
     if skipped_before_window or skipped_qualifier:
         logger.info(
             "%s: filtered out %d fixture(s) before the window and %d qualifying-round fixture(s)",
-            league_cfg["name"], skipped_before_window, skipped_qualifier,
+            league_cfg["name"],
+            skipped_before_window,
+            skipped_qualifier,
         )
 
     if not in_window:
         logger.info(
             "%s: no non-qualifier fixtures within the %d-day window from %s.",
-            league_cfg["name"], days_ahead, reference.strftime("%Y-%m-%d"),
+            league_cfg["name"],
+            days_ahead,
+            reference.strftime("%Y-%m-%d"),
         )
         return 0
 
     logger.info(
         "%s: %d/%d fixtures fall within the %d-day window from %s (qualifiers excluded)",
-        league_cfg["name"], len(in_window), len(games), days_ahead, reference.strftime("%Y-%m-%d"),
+        league_cfg["name"],
+        len(in_window),
+        len(games),
+        days_ahead,
+        reference.strftime("%Y-%m-%d"),
     )
-    return _upsert_games(store, in_window, league_key)
+    return _upsert_games(store, in_window, league_key, forwarder=forwarder)
 
 
-def scrape_all_leagues_window(store: FixtureStore, days_ahead: int = 7) -> dict[str, int]:
+def scrape_all_leagues_window(
+    store: FixtureStore, days_ahead: int = 7, forwarder: Optional[Forwarder] = None
+) -> dict[str, int]:
     """Windowed version of scrape_all_leagues -- this is what poller.py
     calls automatically (on the reactive post-match-completion trigger
     and the twice-daily scheduled backstop). Returns {league_key: count}.
@@ -422,14 +519,19 @@ def scrape_all_leagues_window(store: FixtureStore, days_ahead: int = 7) -> dict[
     reference = store.advance_reference_date_if_needed()
     logger.info(
         "scrape_all_leagues_window: shared reference date = %s, window = %d days",
-        reference.strftime("%Y-%m-%d"), days_ahead,
+        reference.strftime("%Y-%m-%d"),
+        days_ahead,
     )
 
     results: dict[str, int] = {}
     for league_key in config.LEAGUES:
         try:
             results[league_key] = scrape_league_fixtures_window(
-                store, league_key, days_ahead, reference_override=reference
+                store,
+                league_key,
+                days_ahead,
+                reference_override=reference,
+                forwarder=forwarder,
             )
         except Exception as exc:
             logger.error("Windowed scrape failed for league=%s: %s", league_key, exc)
@@ -438,7 +540,9 @@ def scrape_all_leagues_window(store: FixtureStore, days_ahead: int = 7) -> dict[
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Scrape league-based fixtures into the games collection.")
+    parser = argparse.ArgumentParser(
+        description="Scrape league-based fixtures into the games collection."
+    )
     parser.add_argument(
         "--league",
         default="all",
@@ -475,28 +579,59 @@ def main() -> None:
         sys.exit(1)
 
     store = FixtureStore(mongo_uri)
+    forwarder = create_forwarder()
     try:
         if args.round_only:
             if args.league == "all":
-                logger.error("--round-only requires a specific --league (e.g. --league epl), not 'all'.")
+                logger.error(
+                    "--round-only requires a specific --league (e.g. --league epl), not 'all'."
+                )
                 sys.exit(1)
-            count = scrape_one_round(store, args.league, round_num=args.round_num)
-            logger.info("Round scrape complete: %d games upserted into '%s' collection.", count, config.MONGO_COLLECTION)
+            count = scrape_one_round(
+                store, args.league, round_num=args.round_num, forwarder=forwarder
+            )
+            logger.info(
+                "Round scrape complete: %d games upserted into '%s' collection.",
+                count,
+                config.MONGO_COLLECTION,
+            )
         elif args.window:
             if args.league == "all":
-                results = scrape_all_leagues_window(store, days_ahead=args.days_ahead)
+                results = scrape_all_leagues_window(
+                    store, days_ahead=args.days_ahead, forwarder=forwarder
+                )
                 total = sum(results.values())
-                logger.info("Windowed all-league scrape complete: %s (total=%d) into '%s' collection.", results, total, config.MONGO_COLLECTION)
+                logger.info(
+                    "Windowed all-league scrape complete: %s (total=%d) into '%s' collection.",
+                    results,
+                    total,
+                    config.MONGO_COLLECTION,
+                )
             else:
-                count = scrape_league_fixtures_window(store, args.league, days_ahead=args.days_ahead)
-                logger.info("Windowed scrape complete: %d games upserted into '%s' collection.", count, config.MONGO_COLLECTION)
+                count = scrape_league_fixtures_window(
+                    store, args.league, days_ahead=args.days_ahead, forwarder=forwarder
+                )
+                logger.info(
+                    "Windowed scrape complete: %d games upserted into '%s' collection.",
+                    count,
+                    config.MONGO_COLLECTION,
+                )
         elif args.league == "all":
-            results = scrape_all_leagues(store)
+            results = scrape_all_leagues(store, forwarder=forwarder)
             total = sum(results.values())
-            logger.info("All-league scrape complete: %s (total=%d) into '%s' collection.", results, total, config.MONGO_COLLECTION)
+            logger.info(
+                "All-league scrape complete: %s (total=%d) into '%s' collection.",
+                results,
+                total,
+                config.MONGO_COLLECTION,
+            )
         else:
-            count = scrape_league_fixtures(store, args.league)
-            logger.info("Scrape complete: %d games upserted into '%s' collection.", count, config.MONGO_COLLECTION)
+            count = scrape_league_fixtures(store, args.league, forwarder=forwarder)
+            logger.info(
+                "Scrape complete: %d games upserted into '%s' collection.",
+                count,
+                config.MONGO_COLLECTION,
+            )
     except Exception as exc:
         logger.error("Scrape failed: %s", exc)
         sys.exit(1)

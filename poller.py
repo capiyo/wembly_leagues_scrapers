@@ -127,15 +127,26 @@ class MatchStateMachine:
 
         if state == "soon" and current_status == "live":
             if minutes_to_kickoff is not None and minutes_to_kickoff > 0:
-                logger.info(f"🔄 Correcting 'live' → 'soon' ({minutes_to_kickoff:.0f} mins to kickoff)")
+                logger.info(
+                    f"🔄 Correcting 'live' → 'soon' ({minutes_to_kickoff:.0f} mins to kickoff)"
+                )
                 return "soon"
 
         if state == "upcoming" and current_status in ("soon", "live"):
-            if minutes_to_kickoff is not None and minutes_to_kickoff > SOON_THRESHOLD_MINUTES:
-                logger.info(f"🔄 Correcting '{current_status}' → 'upcoming' ({minutes_to_kickoff:.0f} mins to kickoff)")
+            if (
+                minutes_to_kickoff is not None
+                and minutes_to_kickoff > SOON_THRESHOLD_MINUTES
+            ):
+                logger.info(
+                    f"🔄 Correcting '{current_status}' → 'upcoming' ({minutes_to_kickoff:.0f} mins to kickoff)"
+                )
                 return "upcoming"
 
-        if minutes_to_kickoff is not None and minutes_to_kickoff <= 0 and current_status != "live":
+        if (
+            minutes_to_kickoff is not None
+            and minutes_to_kickoff <= 0
+            and current_status != "live"
+        ):
             return "live"
 
         if (
@@ -166,9 +177,13 @@ class MatchStateMachine:
             return True
 
         if state == "soon" and minutes_to_kickoff is not None:
-            should_fetch = LINEUP_LATE_THRESHOLD <= minutes_to_kickoff <= LINEUP_EARLY_THRESHOLD
+            should_fetch = (
+                LINEUP_LATE_THRESHOLD <= minutes_to_kickoff <= LINEUP_EARLY_THRESHOLD
+            )
             if should_fetch:
-                logger.info(f"📋 {match_id}: {minutes_to_kickoff:.0f} mins to kickoff - fetching lineups")
+                logger.info(
+                    f"📋 {match_id}: {minutes_to_kickoff:.0f} mins to kickoff - fetching lineups"
+                )
             return should_fetch
 
         return False
@@ -238,7 +253,9 @@ class Poller:
         # Seeded to "already due" so the very first poll cycle after startup
         # also performs a scrape -- covers the case where the service was
         # just deployed/restarted and `games` is empty.
-        self.last_scheduled_scrape = datetime.now(timezone.utc) - self.SCHEDULED_RESCRAPE_INTERVAL
+        self.last_scheduled_scrape = (
+            datetime.now(timezone.utc) - self.SCHEDULED_RESCRAPE_INTERVAL
+        )
 
     def start(self):
         self.running = True
@@ -272,15 +289,21 @@ class Poller:
             logger.debug("No fixtures found")
             return
 
-        logger.info(f"📊 Poll cycle #{self.poll_count}: Processing {len(all_fixtures)} fixtures")
+        logger.info(
+            f"📊 Poll cycle #{self.poll_count}: Processing {len(all_fixtures)} fixtures"
+        )
 
         for match in all_fixtures:
             try:
                 self._process_match(match)
             except Exception as e:
-                logger.error(f"Error processing match {match.get('matchId')}: {e}", exc_info=True)
+                logger.error(
+                    f"Error processing match {match.get('matchId')}: {e}", exc_info=True
+                )
 
-    def _verify_live_status_with_365scores(self, match: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    def _verify_live_status_with_365scores(
+        self, match: Dict[str, Any]
+    ) -> Tuple[bool, Optional[str]]:
         match_id = match.get("matchId")
         game_id = match.get("threesixtyfiveGameId")
         away_id = match.get("away_competitor_id")
@@ -311,8 +334,10 @@ class Poller:
         away_score = game.get("awayCompetitor", {}).get("score")
 
         has_real_score = (
-            home_score is not None and away_score is not None and
-            home_score >= 0 and away_score >= 0
+            home_score is not None
+            and away_score is not None
+            and home_score >= 0
+            and away_score >= 0
         )
 
         logger.debug(
@@ -330,7 +355,15 @@ class Poller:
         elif status_group == STATUS_GROUP_FINISHED:
             return False, "finished"
         else:
-            live_markers = ("1st half", "2nd half", "first half", "second half", "halftime", "ht", "live")
+            live_markers = (
+                "1st half",
+                "2nd half",
+                "first half",
+                "second half",
+                "halftime",
+                "ht",
+                "live",
+            )
             if any(marker in status_text.lower() for marker in live_markers):
                 return True, status_text
             return False, status_text
@@ -350,7 +383,9 @@ class Poller:
         if kickoff_utc:
             if isinstance(kickoff_utc, str):
                 try:
-                    kickoff_utc = datetime.fromisoformat(kickoff_utc.replace("Z", "+00:00"))
+                    kickoff_utc = datetime.fromisoformat(
+                        kickoff_utc.replace("Z", "+00:00")
+                    )
                 except ValueError:
                     pass
             if isinstance(kickoff_utc, datetime):
@@ -375,7 +410,9 @@ class Poller:
             # match got yanked back to "live" (with score reset to 0-0)
             # every single poll cycle, forever, re-triggering settlement
             # and move-to-history on each pass.
-            is_actually_live, verify_status_text = self._verify_live_status_with_365scores(match)
+            is_actually_live, verify_status_text = (
+                self._verify_live_status_with_365scores(match)
+            )
 
             if not is_actually_live:
                 logger.info(
@@ -398,16 +435,18 @@ class Poller:
                 known_home_score = match.get("homeScore") or 0
                 known_away_score = match.get("awayScore") or 0
 
-                self.forwarder.forward_live_update({
-                    "fixture_id": match_id,
-                    "event_type": "status_change",
-                    "status": "live",
-                    "home_score": known_home_score,
-                    "away_score": known_away_score,
-                    "is_live": True,
-                    "available_for_voting": False,
-                    "minutes_to_kickoff": minutes_to_kickoff,
-                })
+                self.forwarder.forward_live_update(
+                    {
+                        "fixture_id": match_id,
+                        "event_type": "status_change",
+                        "status": "live",
+                        "home_score": known_home_score,
+                        "away_score": known_away_score,
+                        "is_live": True,
+                        "available_for_voting": False,
+                        "minutes_to_kickoff": minutes_to_kickoff,
+                    }
+                )
                 match["status"] = "live"
                 current_status = "live"
                 self._notify_match_live(match)
@@ -417,16 +456,26 @@ class Poller:
         if new_status and new_status != current_status:
             if new_status == "live":
                 if kickoff_passed:
-                    logger.info(f"⏰ {match_id}: Kickoff passed, transitioning to 'live'")
+                    logger.info(
+                        f"⏰ {match_id}: Kickoff passed, transitioning to 'live'"
+                    )
                 else:
                     is_actually_live, _ = self._verify_live_status_with_365scores(match)
-                    if not is_actually_live and minutes_to_kickoff is not None and minutes_to_kickoff > 2:
+                    if (
+                        not is_actually_live
+                        and minutes_to_kickoff is not None
+                        and minutes_to_kickoff > 2
+                    ):
                         logger.info(
                             f"⏳ {match_id}: 365Scores says not live yet, delaying 'soon' → 'live' "
                             f"({minutes_to_kickoff:.0f} mins to kickoff)"
                         )
                         new_status = None
-                    elif not is_actually_live and minutes_to_kickoff is not None and minutes_to_kickoff <= 2:
+                    elif (
+                        not is_actually_live
+                        and minutes_to_kickoff is not None
+                        and minutes_to_kickoff <= 2
+                    ):
                         logger.info(
                             f"⏰ {match_id}: Near kickoff ({minutes_to_kickoff:.0f} mins) — "
                             f"transitioning to 'live' even though 365Scores not updated yet"
@@ -435,14 +484,16 @@ class Poller:
             if new_status and new_status != current_status:
                 logger.info(f"📊 {match_id}: {current_status} → {new_status}")
                 self.store.update_status(match_id, new_status)
-                self.forwarder.forward_live_update({
-                    "fixture_id": match_id,
-                    "event_type": "status_change",
-                    "status": new_status,
-                    "is_live": new_status == "live",
-                    "available_for_voting": new_status in ["upcoming", "soon"],
-                    "minutes_to_kickoff": minutes_to_kickoff,
-                })
+                self.forwarder.forward_live_update(
+                    {
+                        "fixture_id": match_id,
+                        "event_type": "status_change",
+                        "status": new_status,
+                        "is_live": new_status == "live",
+                        "available_for_voting": new_status in ["upcoming", "soon"],
+                        "minutes_to_kickoff": minutes_to_kickoff,
+                    }
+                )
                 match["status"] = new_status
                 current_status = new_status
 
@@ -453,7 +504,9 @@ class Poller:
                 if new_status == "live":
                     self._notify_match_live(match)
 
-        if self.state_machine.should_fetch_lineups(match, current_status, minutes_to_kickoff):
+        if self.state_machine.should_fetch_lineups(
+            match, current_status, minutes_to_kickoff
+        ):
             self._fetch_and_forward_lineups(match)
             self.state_machine.mark_lineups_done(match_id)
 
@@ -551,7 +604,9 @@ class Poller:
         away_team = match.get("awayTeam")
 
         if not all([game_id, away_id, home_id]):
-            logger.warning(f"Missing competitor IDs for {match_id}, cannot fetch lineups")
+            logger.warning(
+                f"Missing competitor IDs for {match_id}, cannot fetch lineups"
+            )
             return
 
         logger.info(f"📋 Fetching lineups for {match_id}...")
@@ -616,11 +671,13 @@ class Poller:
             minute = int(stats.get("minute", 0) or 0)
             team_stats = {"home": stats.get("home", {}), "away": stats.get("away", {})}
             self.store.add_statistics_snapshot(match_id, team_stats, minute)
-            self.forwarder.forward_statistics({
-                "fixture_id": match_id,
-                "minute": minute,
-                "statistics": team_stats,
-            })
+            self.forwarder.forward_statistics(
+                {
+                    "fixture_id": match_id,
+                    "minute": minute,
+                    "statistics": team_stats,
+                }
+            )
             logger.debug(f"📊 Statistics forwarded for {match_id} at {minute}'")
 
     def _settle_and_complete_match(self, match: Dict[str, Any], game: Dict[str, Any]):
@@ -642,7 +699,9 @@ class Poller:
         else:
             result = "draw"
 
-        logger.info(f"💰 Settling bets for {match_id}: {result} ({home_score}-{away_score})")
+        logger.info(
+            f"💰 Settling bets for {match_id}: {result} ({home_score}-{away_score})"
+        )
 
         self._settle_over_under_market(match_id, home_score, away_score)
 
@@ -660,7 +719,9 @@ class Poller:
                 self.state_machine.mark_completed_notified(match_id)
                 self._trigger_rescrape(reason=f"{match_id} archived via settlement")
             else:
-                logger.warning(f"⚠️ Match {match_id} settled but failed to move to history")
+                logger.warning(
+                    f"⚠️ Match {match_id} settled but failed to move to history"
+                )
         else:
             self.state_machine.record_settlement_attempt(match_id)
             logger.warning(
@@ -701,17 +762,27 @@ class Poller:
 
             team = event.get("team")
             if not team:
-                logger.debug(f"{match_id}: first {event_type} has no resolvable team, skipping settlement")
+                logger.debug(
+                    f"{match_id}: first {event_type} has no resolvable team, skipping settlement"
+                )
                 continue
 
-            logger.info(f"🎯 {match_id}: first {event_type} -> {team} at {event.get('minute')}'")
-            success = self.forwarder.settle_sub_fixture_market(match_id, market_id, team)
+            logger.info(
+                f"🎯 {match_id}: first {event_type} -> {team} at {event.get('minute')}'"
+            )
+            success = self.forwarder.settle_sub_fixture_market(
+                match_id, market_id, team
+            )
             if success:
                 self.state_machine.mark_sub_fixture_market_settled(match_id, market_id)
             else:
-                logger.warning(f"⚠️ Failed to settle {market_id} for {match_id}, will retry next poll")
+                logger.warning(
+                    f"⚠️ Failed to settle {market_id} for {match_id}, will retry next poll"
+                )
 
-    def _settle_over_under_market(self, match_id: str, home_score: Optional[int], away_score: Optional[int]):
+    def _settle_over_under_market(
+        self, match_id: str, home_score: Optional[int], away_score: Optional[int]
+    ):
         """Settle the over/under 2.5 goals sub-fixture market once the
         match has a final score. Safe to call more than once -- dedup is
         handled via state_machine.is_sub_fixture_market_settled."""
@@ -721,7 +792,9 @@ class Poller:
             return
 
         if home_score is None or away_score is None:
-            logger.warning(f"⚠️ {match_id}: missing final score, cannot settle {market_id}")
+            logger.warning(
+                f"⚠️ {match_id}: missing final score, cannot settle {market_id}"
+            )
             return
 
         total_goals = home_score + away_score
@@ -732,7 +805,9 @@ class Poller:
         if success:
             self.state_machine.mark_sub_fixture_market_settled(match_id, market_id)
         else:
-            logger.warning(f"⚠️ Failed to settle {market_id} for {match_id}, will retry next poll")
+            logger.warning(
+                f"⚠️ Failed to settle {market_id} for {match_id}, will retry next poll"
+            )
 
     def _fetch_live_updates(self, match: Dict[str, Any]):
         match_id = match.get("matchId")
@@ -763,8 +838,10 @@ class Poller:
         away_score = away_comp.get("score")
 
         has_real_score = (
-            home_score is not None and away_score is not None and
-            home_score >= 0 and away_score >= 0
+            home_score is not None
+            and away_score is not None
+            and home_score >= 0
+            and away_score >= 0
         )
 
         if has_real_score:
@@ -787,7 +864,9 @@ class Poller:
         phase = threesixtyfive.classify_match_phase(status_text)
 
         if self.state_machine.should_forward_statistics(match_id, phase):
-            logger.info(f"📊 {match_id}: phase={phase} ({status_text!r}) - fetching statistics")
+            logger.info(
+                f"📊 {match_id}: phase={phase} ({status_text!r}) - fetching statistics"
+            )
             self._fetch_and_forward_statistics(match, game=game)
             self.state_machine.mark_stats_forwarded(match_id, phase)
 
@@ -802,7 +881,9 @@ class Poller:
 
             # Check if we should retry settlement
             if not self.state_machine.should_retry_settlement(match_id):
-                logger.warning(f"⚠️ {match_id}: Max settlement retries reached, forcing completion")
+                logger.warning(
+                    f"⚠️ {match_id}: Max settlement retries reached, forcing completion"
+                )
                 self.store.update_status(match_id, "completed")
                 self._settle_over_under_market(
                     match_id,
@@ -852,10 +933,14 @@ class Poller:
         try:
             logger.info(f"🔄 Triggering league rescrape ({reason})...")
             results = leagues_scraper.scrape_all_leagues_window(
-                self.store, days_ahead=config.REFERENCE_WINDOW_DAYS
+                self.store,
+                days_ahead=config.REFERENCE_WINDOW_DAYS,
+                forwarder=self.forwarder,
             )
             total = sum(results.values())
-            logger.info(f"✅ Rescrape complete: {results} (total={total} fixtures upserted)")
+            logger.info(
+                f"✅ Rescrape complete: {results} (total={total} fixtures upserted)"
+            )
         except Exception as e:
             logger.error(f"❌ Rescrape failed: {e}")
 
@@ -881,7 +966,9 @@ class Poller:
 
         if success:
             self.state_machine.mark_completed_notified(match_id)
-            logger.info(f"🏁 Match {match_id} finalized: {result} ({home_score}-{away_score})")
+            logger.info(
+                f"🏁 Match {match_id} finalized: {result} ({home_score}-{away_score})"
+            )
             self._trigger_rescrape(reason=f"{match_id} finalized")
 
     def _notify_match_live(self, match: Dict[str, Any]):
