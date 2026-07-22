@@ -53,6 +53,7 @@ class Forwarder:
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to POST to {endpoint}: {e}")
             if hasattr(e, "response") and e.response:
+                logger.error(f"Payload: {data}")
                 logger.error(f"Response: {e.response.text[:500]}")
             return False
 
@@ -102,28 +103,74 @@ class Forwarder:
         """
         Forward a live match update to the Rust API.
 
-        Expected payload:
+        Matches LiveGameUpdate struct in Rust:
         {
-            "fixture_id": "wc26_123",
-            "event_type": "live_update|score|status|goal|card|substitution",
-            "home_score": 1,
-            "away_score": 0,
+            "fixtureId": "wc26_123",
+            "eventType": "score_update",
+            "homeScore": 1,
+            "awayScore": 0,
             "minute": 67,
-            "minute_display": "67'",
-            "status": "live|completed",
-            "is_live": true,
-            "available_for_voting": false,
-            "scorer": "home_team|away_team",
+            "minuteDisplay": "67'",
+            "status": "live",
+            "isLive": true,
+            "availableForVoting": false,
+            "scorer": "Player Name",
             "player": "Player Name",
             "assist": "Assist Name",
-            "team": "home|away"
+            "team": "home",
+            "timestamp": "2026-07-22T15:05:18Z",
+            "minutesPlayed": 67
         }
         """
-        # Add timestamp if not present
-        if "timestamp" not in update:
-            update["timestamp"] = datetime.now(timezone.utc).isoformat()
+        # Build payload with camelCase keys matching Rust struct
+        payload = {}
 
-        return self._post("/games/live-update", update)
+        # Required fields - must always be present
+        payload["fixtureId"] = update.get("fixture_id") or update.get("fixtureId")
+        if not payload["fixtureId"]:
+            logger.error("Missing fixture_id in live update")
+            return False
+
+        payload["eventType"] = (
+            update.get("event_type") or update.get("eventType") or "score_update"
+        )
+        payload["homeScore"] = int(
+            update.get("home_score") or update.get("homeScore") or 0
+        )
+        payload["awayScore"] = int(
+            update.get("away_score") or update.get("awayScore") or 0
+        )
+        payload["minute"] = int(update.get("minute") or update.get("gameTime") or 0)
+
+        # Optional fields - only include if present
+        if "minute_display" in update or "minuteDisplay" in update:
+            payload["minuteDisplay"] = update.get("minute_display") or update.get(
+                "minuteDisplay"
+            )
+        if "status" in update:
+            payload["status"] = update.get("status")
+        if "is_live" in update:
+            payload["isLive"] = update.get("is_live")
+        if "available_for_voting" in update:
+            payload["availableForVoting"] = update.get("available_for_voting")
+        if "scorer" in update:
+            payload["scorer"] = update.get("scorer")
+        if "player" in update:
+            payload["player"] = update.get("player")
+        if "assist" in update:
+            payload["assist"] = update.get("assist")
+        if "team" in update:
+            payload["team"] = update.get("team")
+        if "timestamp" in update:
+            payload["timestamp"] = update.get("timestamp")
+        elif "timestamp" not in payload:
+            payload["timestamp"] = datetime.now(timezone.utc).isoformat()
+        if "minutes_played" in update or "minutesPlayed" in update:
+            payload["minutesPlayed"] = update.get("minutes_played") or update.get(
+                "minutesPlayed"
+            )
+
+        return self._post("/games/live-update", payload)
 
     def forward_score_update(
         self, match_id: str, home_score: int, away_score: int, minute: int
@@ -132,10 +179,10 @@ class Forwarder:
         Forward a score update.
         """
         payload = {
-            "fixture_id": match_id,
-            "event_type": "score",
-            "home_score": home_score,
-            "away_score": away_score,
+            "fixtureId": match_id,
+            "eventType": "score",
+            "homeScore": home_score,
+            "awayScore": away_score,
             "minute": minute,
         }
         return self._post("/games/score", payload)
@@ -147,10 +194,10 @@ class Forwarder:
         Forward a status update.
         """
         payload = {
-            "fixture_id": match_id,
+            "fixtureId": match_id,
             "status": status,
-            "is_live": is_live,
-            "available_for_voting": available_for_voting,
+            "isLive": is_live,
+            "availableForVoting": available_for_voting,
         }
         return self._post("/games/status", payload)
 
@@ -162,19 +209,52 @@ class Forwarder:
         """
         Forward a single event to the Rust API.
 
-        Expected payload:
+        Matches EventRequest struct:
         {
-            "fixture_id": "wc26_123",
-            "event_type": "goal|yellow_card|red_card|substitution|penalty|own_goal",
+            "fixtureId": "wc26_123",
+            "eventType": "goal",
             "minute": 23,
-            "team": "home|away",
+            "team": "home",
             "player": "Player Name",
-            "assist": "Assist Name (optional)",
-            "home_score": 1,
-            "away_score": 0,
+            "assist": "Assist Name",
+            "homeScore": 1,
+            "awayScore": 0,
         }
         """
-        return self._post("/games/events", event)
+        # Build payload with camelCase keys
+        payload = {}
+        payload["fixtureId"] = event.get("fixture_id") or event.get("fixtureId")
+        if not payload["fixtureId"]:
+            logger.error("Missing fixture_id in event")
+            return False
+
+        payload["eventType"] = event.get("event_type") or event.get("eventType")
+        if not payload["eventType"]:
+            logger.error("Missing event_type in event")
+            return False
+
+        payload["minute"] = int(event.get("minute") or 0)
+        payload["team"] = event.get("team")
+        if not payload["team"]:
+            logger.error("Missing team in event")
+            return False
+
+        payload["player"] = event.get("player")
+        if not payload["player"]:
+            logger.error("Missing player in event")
+            return False
+
+        payload["homeScore"] = int(
+            event.get("home_score") or event.get("homeScore") or 0
+        )
+        payload["awayScore"] = int(
+            event.get("away_score") or event.get("awayScore") or 0
+        )
+
+        if "assist" in event:
+            payload["assist"] = event.get("assist")
+
+        return self._post("/games/events", payload)
 
     def forward_bulk_events(self, bulk: Dict[str, Any]) -> bool:
         """
@@ -182,10 +262,10 @@ class Forwarder:
 
         Expected payload:
         {
-            "fixture_id": "wc26_123",
+            "fixtureId": "wc26_123",
             "events": [
                 {
-                    "event_type": "goal",
+                    "eventType": "goal",
                     "minute": 23,
                     "team": "home",
                     "player": "Player Name",
@@ -259,14 +339,6 @@ class Forwarder:
         Build a commentary entry matching CommentaryEntry exactly:
         { minute: i32, text: String, type: String, team: Option<String>,
           player: Option<String>, createdAt: BsonDateTime }.
-
-        This forwarder previously passed entries straight through
-        untouched in forward_commentary/forward_commentary_bulk, trusting
-        the caller to have already shaped them correctly -- but nothing
-        upstream was wrapping createdAt as Extended JSON, so every
-        commentary POST 422'd. Normalizing here, at the forwarder
-        boundary, means it's fixed regardless of what shape the caller's
-        entry dict is in.
         """
         try:
             minute = int(entry.get("minute", 0))
@@ -483,30 +555,19 @@ class Forwarder:
         return self._post(f"/games/{fixture_id}/move-to-history", {})
 
     # ============================================================
-    # SUB-FIXTURE MARKETS (first_goal / first_card / first_corner /
-    # over_under_2_5 props)
+    # SUB-FIXTURE MARKETS
     # ============================================================
-    # Hits the Rust /sub_fixtures/sub-fixture/market/create route
-    # (create_sub_fixture_market_handler in sub_fixture_handler.rs), which
-    # is idempotent server-side (checks for an existing matchId+marketId
-    # doc before inserting) -- same guarantee mongo_store.py's
-    # SubFixtureStore.create_market() would have given via $setOnInsert,
-    # just reached over HTTP through the Rust API instead of a direct
-    # Mongo write from Python.
 
     def create_sub_fixture_market(
         self,
         match_id: str,
-        market_type: str,  # "first_goal" | "first_card" | "first_corner" | "over_under_2_5"
-        options: List[str],  # e.g. ["home", "away"] or ["over", "under"]
+        market_type: str,
+        options: List[str],
         line: Optional[float] = None,
-        lock_at: Optional[str] = None,  # RFC3339 string if provided
+        lock_at: Optional[str] = None,
     ) -> bool:
         """
-        Create a single sub-fixture market for a fixture. Returns False
-        (and logs the response body) on any non-2xx response, same as
-        every other forward_* method here -- callers should treat a
-        False return as "did not get created, don't assume it exists."
+        Create a single sub-fixture market for a fixture.
         """
         payload = {
             "match_id": match_id,
@@ -521,17 +582,7 @@ class Forwarder:
         """
         Create the standard set of sub-fixture markets for a newly
         created fixture: first_goal, first_card, first_corner, and
-        over_under_2_5. Called exactly once per fixture -- from
-        leagues_scraper.py's _upsert_games, gated on upsert_fixture(...)
-        returning True (is_new) -- never on later re-scrapes of a fixture
-        that already exists, so a match never accumulates duplicate
-        markets from repeated scrape triggers.
-
-        Returns True only if every market was created successfully. On
-        partial failure, whichever markets DID succeed are left in place
-        (they're idempotent to retry, but this method itself is not
-        re-invoked automatically -- see the is_new-gated call site's
-        warning log).
+        over_under_2_5.
         """
         markets = [
             {"market_type": "first_goal", "options": ["home", "away"]},
@@ -568,19 +619,6 @@ class Forwarder:
     def forward_notification(self, notification: Dict[str, Any]) -> bool:
         """
         Forward a notification to the Rust API.
-
-        Expected payload:
-        {
-            "fixture_id": "wc26_123",
-            "event_type": "match_live|lineups_available|goal_scored|match_ended",
-            "title": "⚽ Match is LIVE!",
-            "body": "Team A vs Team B is now live!",
-            "data": {
-                "home_team": "Team A",
-                "away_team": "Team B",
-                "score": "1-0"
-            }
-        }
         """
         return self._post("/games/notify", notification)
 
@@ -711,21 +749,6 @@ class Forwarder:
     def sync_live_data(self, live_data: Dict[str, Any]) -> bool:
         """
         Sync live data for multiple matches at once.
-
-        Expected payload:
-        {
-            "timestamp": "2026-06-27T15:00:00Z",
-            "matches": [
-                {
-                    "fixture_id": "wc26_123",
-                    "home_score": 1,
-                    "away_score": 0,
-                    "status": "live",
-                    "events": [...],
-                    "statistics": {...}
-                }
-            ]
-        }
         """
         return self._post("/games/sync/live", live_data)
 
