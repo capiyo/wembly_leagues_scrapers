@@ -5,6 +5,7 @@ ARCHITECTURE:
 365Scores is the sole live data source — fixtures discovery, score, status,
 and structured events (goal/card/sub) all come from it.
 """
+
 from __future__ import annotations
 
 import os
@@ -97,3 +98,115 @@ REFERENCE_WINDOW_DAYS = 11
 # building the "top of feed" response (EPL first, down to Community
 # Shield). Qualifying rounds are excluded regardless of league.
 PRIORITY_LEAGUE_ORDER = ["epl", "ucl", "europa", "facup", "community_shield"]
+
+# ============================================================
+# CLUB FRIENDLIES (EPL / Serie A clubs only) -- leagues_scraper.py
+# ============================================================
+# IMPORTANT: 365Scores does NOT have a separate competitionId per
+# parent league for friendlies -- there is no "EPL friendlies" or
+# "Serie A friendlies" id to fetch. Every club's friendly worldwide
+# (6000+ clubs) is pooled into ONE competition, "Club Friendlies",
+# verified live at:
+#   https://www.365scores.com/football/league/club-friendlies-321
+# If this ever starts returning 0 games, re-derive the id from that
+# URL's trailing number, same as the LEAGUES dict above.
+FRIENDLIES_COMPETITION_ID = 321
+
+# Because the id above is a single global "everyone's friendlies"
+# bucket, leagues_scraper.py fetches it whole and then narrows it down
+# to only fixtures where at least one side is a club in these name
+# lists (case-insensitive substring match against 365Scores'
+# homeCompetitor/awayCompetitor "name" field -- see
+# threesixtyfive.filter_games_by_club_names). Several aliases are
+# listed per club since 365Scores' display name doesn't always match
+# the club's full/common English name (e.g. "Man City" vs "Manchester
+# City", "Spurs" vs "Tottenham", "Inter" vs "Internazionale").
+#
+# Rosters below reflect the CONFIRMED 2026-27 line-ups as of the top
+# of this season (verified July 2026, not carried over from the
+# 2025-26 season):
+#   EPL: Coventry City, Ipswich Town, Hull City promoted, replacing
+#        Wolves, Burnley, West Ham (relegated).
+#   Serie A: Venezia, Frosinone, Monza promoted, replacing Cremonese,
+#        Hellas Verona, Pisa (relegated).
+# Re-check both lists every close season -- a stale list here silently
+# drops that club's friendlies (false negative) or, if a promoted/
+# relegated club shares a name fragment with an existing entry,
+# wrongly includes friendlies that belong to a different division
+# entirely (false positive).
+EPL_CLUB_NAMES = [
+    "Liverpool",
+    "Arsenal",
+    "Manchester City",
+    "Man City",
+    "Chelsea",
+    "Newcastle",
+    "Aston Villa",
+    "Nottingham Forest",
+    "Nott'm Forest",
+    "Brighton",
+    "Bournemouth",
+    "Fulham",
+    "Crystal Palace",
+    "Everton",
+    "Brentford",
+    "Manchester United",
+    "Man Utd",
+    "Man United",
+    "Tottenham",
+    "Spurs",
+    "Sunderland",
+    "Leeds",
+    "Coventry",
+    "Ipswich",
+    "Hull City",
+    "Hull",
+]
+
+SERIEA_CLUB_NAMES = [
+    "Atalanta",
+    "Bologna",
+    "Cagliari",
+    "Como",
+    "Fiorentina",
+    "Frosinone",
+    "Genoa",
+    "Inter",
+    "Internazionale",
+    "Juventus",
+    "Juve",
+    "Lazio",
+    "Lecce",
+    "AC Milan",
+    "Milan",
+    "Monza",
+    "Napoli",
+    "Parma",
+    "Roma",
+    "Sassuolo",
+    "Torino",
+    "Udinese",
+    "Venezia",
+]
+
+# Default friendlies window: 10 days starting 2026-07-26, per the
+# pre-season friendly slate requested when this was set up. Override
+# with --start-date/--days on leagues_scraper.py's CLI for any later
+# window once this one has passed.
+FRIENDLIES_DEFAULT_START_DATE = "2026-07-25"
+FRIENDLIES_DEFAULT_RANGE_DAYS = 10
+
+FRIENDLIES = {
+    "epl_friendlies": {
+        "competition_id": FRIENDLIES_COMPETITION_ID,
+        "name": "Premier League Club Friendlies",
+        "prefix": "epl_friendly",
+        "club_names": EPL_CLUB_NAMES,
+    },
+    "seriea_friendlies": {
+        "competition_id": FRIENDLIES_COMPETITION_ID,
+        "name": "Serie A Club Friendlies",
+        "prefix": "seriea_friendly",
+        "club_names": SERIEA_CLUB_NAMES,
+    },
+}

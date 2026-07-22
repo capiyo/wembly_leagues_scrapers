@@ -2,6 +2,7 @@
 365Scores API client for World Cup data.
 Fetches: fixtures, live scores, events, lineups, statistics, and commentary.
 """
+
 from __future__ import annotations
 
 import logging
@@ -51,7 +52,15 @@ def is_game_finished(game: Dict[str, Any]) -> bool:
 
     # Check 3: statusText - 365Scores uses "Ended"
     status_text = (game.get("statusText") or "").strip().lower()
-    finished_keywords = ["ended", "finished", "ft", "full-time", "aet", "pen", "penalties"]
+    finished_keywords = [
+        "ended",
+        "finished",
+        "ft",
+        "full-time",
+        "aet",
+        "pen",
+        "penalties",
+    ]
     if status_text in finished_keywords:
         return True
 
@@ -63,7 +72,10 @@ def is_game_finished(game: Dict[str, Any]) -> bool:
             # Also check if we have a winner (both scores set)
             home_comp = game.get("homeCompetitor", {})
             away_comp = game.get("awayCompetitor", {})
-            if home_comp.get("score") is not None and away_comp.get("score") is not None:
+            if (
+                home_comp.get("score") is not None
+                and away_comp.get("score") is not None
+            ):
                 return True
 
     # Check 5: If game has ended but statusText contains "ended" in any form
@@ -102,7 +114,9 @@ def fetch_games_by_competition(
 
         data = response.json()
         games = data.get("games", [])
-        logger.info(f"fetch_games_by_competition({competition_ids}): {len(games)} games returned")
+        logger.info(
+            f"fetch_games_by_competition({competition_ids}): {len(games)} games returned"
+        )
 
         return games
 
@@ -114,13 +128,104 @@ def fetch_games_by_competition(
         return None
 
 
+def fetch_games_by_date_range(
+    competition_ids: List[int],
+    start_date: str,
+    end_date: str,
+    timezone_name: str = "Africa/Nairobi",
+    user_country_id: int = 413,
+    show_odds: bool = True,
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    Same endpoint as fetch_games_by_competition, but scoped to a date
+    window via startDate/endDate. Needed for Club Friendlies
+    (competitionId=321): that single competition pools every friendly
+    for 6000+ clubs worldwide, so fetching it without a date bound
+    would return a huge, mostly-irrelevant payload. startDate/endDate
+    are accepted by the same /web/games/fixtures/ endpoint used in
+    fetch_games_by_competition -- both params are "YYYY-MM-DD".
+    """
+    params = {
+        "appTypeId": 5,
+        "langId": 1,
+        "timezoneName": timezone_name,
+        "userCountryId": user_country_id,
+        "competitions": ",".join(str(cid) for cid in competition_ids),
+        "startDate": start_date,
+        "endDate": end_date,
+        "showOdds": str(show_odds).lower(),
+        "includeTopBettingOpportunity": "1",
+        "topBookmaker": "14",
+    }
+
+    url = f"{BASE_URL}/web/games/fixtures/"
+
+    try:
+        logger.debug(f"Fetching from {url} with params {params}")
+        response = requests.get(url, headers=DEFAULT_HEADERS, params=params, timeout=30)
+        response.raise_for_status()
+
+        data = response.json()
+        games = data.get("games", [])
+        logger.info(
+            f"fetch_games_by_date_range({competition_ids}, {start_date}..{end_date}): "
+            f"{len(games)} games returned"
+        )
+
+        return games
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to fetch games from 365Scores: {e}")
+        return None
+    except ValueError as e:
+        logger.error(f"Failed to parse JSON response: {e}")
+        return None
+
+
+def filter_games_by_club_names(
+    games: List[Dict[str, Any]],
+    club_names: List[str],
+) -> List[Dict[str, Any]]:
+    """
+    Keep only games where the home OR away competitor name contains
+    (case-insensitive) one of club_names. Needed because 365Scores has
+    no per-parent-league friendlies competitionId -- Club Friendlies
+    (id 321) pools every club worldwide, so narrowing down to "just
+    EPL clubs' friendlies" or "just Serie A clubs' friendlies" has to
+    happen client-side against team names, not via a competitionId.
+
+    Substring match (not exact-equals) because 365Scores' name field
+    sometimes carries extra qualifiers 365Scores itself adds for
+    disambiguation (e.g. suffixed age-group/reserve-team markers on
+    otherwise-identical club names) -- config.py's *_CLUB_NAMES lists
+    already carry the common aliases (e.g. "Man City", "Spurs") to
+    catch 365Scores' own display-name variants.
+    """
+    needles = [n.lower() for n in club_names]
+
+    def _matches(name: Optional[str]) -> bool:
+        if not name:
+            return False
+        name_lower = name.lower()
+        return any(needle in name_lower for needle in needles)
+
+    filtered = []
+    for game in games:
+        home_name = (game.get("homeCompetitor") or {}).get("name")
+        away_name = (game.get("awayCompetitor") or {}).get("name")
+        if _matches(home_name) or _matches(away_name):
+            filtered.append(game)
+
+    return filtered
+
+
 def fetch_game_details(
     game_id: str,
     away_id: int,
     home_id: int,
     competition_id: int,
     lang_id: int = 1,
-    user_country_id: int = 413
+    user_country_id: int = 413,
 ) -> Optional[Dict[str, Any]]:
     """
     Fetch full game details including lineups using the /web/game/ endpoint.
@@ -167,10 +272,7 @@ def fetch_game_details(
 
 
 def fetch_lineups(
-    game_id: str,
-    away_id: int,
-    home_id: int,
-    competition_id: int
+    game_id: str, away_id: int, home_id: int, competition_id: int
 ) -> Optional[Dict[str, Any]]:
     """
     Fetch only lineups from the game details endpoint.
@@ -243,8 +345,23 @@ def fetch_lineups(
 # "suspended" too. \b works fine for multi-word phrases like "half time"
 # since spaces are already non-word characters.
 HALFTIME_STATUS_KEYWORDS = ("ht", "half time", "halftime")
-STOPPED_STATUS_KEYWORDS = ("stopped", "suspended", "interrupted", "delayed", "abandoned")
-FULLTIME_STATUS_KEYWORDS = ("ft", "aet", "pen", "ended", "finished", "full-time", "full time", "penalties")
+STOPPED_STATUS_KEYWORDS = (
+    "stopped",
+    "suspended",
+    "interrupted",
+    "delayed",
+    "abandoned",
+)
+FULLTIME_STATUS_KEYWORDS = (
+    "ft",
+    "aet",
+    "pen",
+    "ended",
+    "finished",
+    "full-time",
+    "full time",
+    "penalties",
+)
 
 
 def _matches(text: str, keywords: tuple) -> bool:
@@ -308,10 +425,7 @@ def extract_statistics_from_game(game: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def fetch_statistics(
-    game_id: str,
-    away_id: int,
-    home_id: int,
-    competition_id: int
+    game_id: str, away_id: int, home_id: int, competition_id: int
 ) -> Optional[Dict[str, Any]]:
     """
     Fetch statistics from the game details endpoint.
@@ -350,11 +464,9 @@ def fetch_statistics(
 #      elsewhere in this codebase.
 # ============================================================================
 
+
 def _fetch_play_by_play_raw(
-    game_id: str,
-    away_id: int,
-    home_id: int,
-    competition_id: int
+    game_id: str, away_id: int, home_id: int, competition_id: int
 ) -> List[Dict[str, Any]]:
     """Shared fetch + unwrap for the play-by-play feed. Both
     fetch_commentary() and fetch_match_events() parse this same raw list
@@ -422,10 +534,7 @@ def _competitor_num_to_side(competitor_num: Any) -> Optional[str]:
 
 
 def fetch_commentary(
-    game_id: str,
-    away_id: int,
-    home_id: int,
-    competition_id: int
+    game_id: str, away_id: int, home_id: int, competition_id: int
 ) -> List[Dict[str, Any]]:
     """
     Fetch commentary via 365Scores' separate play-by-play feed. See the
@@ -460,13 +569,15 @@ def fetch_commentary(
         players = entry.get("Players") or []
         player = players[0].get("PlayerName") if players else None
 
-        commentary_list.append({
-            "minute": minute,
-            "text": text,
-            "type": entry.get("TypeName", "commentary"),
-            "team": _competitor_num_to_side(entry.get("CompetitorNum")),
-            "player": player,
-        })
+        commentary_list.append(
+            {
+                "minute": minute,
+                "text": text,
+                "type": entry.get("TypeName", "commentary"),
+                "team": _competitor_num_to_side(entry.get("CompetitorNum")),
+                "player": player,
+            }
+        )
 
     logger.info(f"fetch_commentary({game_id}): Found {len(commentary_list)} entries")
     return commentary_list
@@ -480,7 +591,9 @@ def fetch_commentary(
 # and adjust if 365Scores uses different wording.
 _CARD_TYPENAME_MARKERS = ("yellow card", "red card", "second yellow")
 _CORNER_TYPENAME_MARKERS = ("corner",)
-_GOAL_TYPENAME_MARKERS = ("goal",)  # checked last: "goal" is a substring of nothing above, but keep order defensive
+_GOAL_TYPENAME_MARKERS = (
+    "goal",
+)  # checked last: "goal" is a substring of nothing above, but keep order defensive
 
 
 def _classify_event_typename(type_name: Optional[str]) -> Optional[str]:
@@ -495,10 +608,7 @@ def _classify_event_typename(type_name: Optional[str]) -> Optional[str]:
 
 
 def fetch_match_events(
-    game_id: str,
-    away_id: int,
-    home_id: int,
-    competition_id: int
+    game_id: str, away_id: int, home_id: int, competition_id: int
 ) -> List[Dict[str, Any]]:
     """
     Discrete goal/card/corner events, derived from the SAME play-by-play
@@ -555,23 +665,24 @@ def fetch_match_events(
         players = entry.get("Players") or []
         player = players[0].get("PlayerName") if players else None
 
-        events.append({
-            "event_type": event_type,
-            "minute": minute,
-            "team": team,
-            "player": player,
-        })
+        events.append(
+            {
+                "event_type": event_type,
+                "minute": minute,
+                "team": team,
+                "player": player,
+            }
+        )
 
     events.sort(key=lambda e: e["minute"])
-    logger.info(f"fetch_match_events({game_id}): Found {len(events)} goal/card/corner events")
+    logger.info(
+        f"fetch_match_events({game_id}): Found {len(events)} goal/card/corner events"
+    )
     return events
 
 
 def fetch_complete_match_data(
-    game_id: str,
-    away_id: int,
-    home_id: int,
-    competition_id: int
+    game_id: str, away_id: int, home_id: int, competition_id: int
 ) -> Optional[Dict[str, Any]]:
     """
     Fetch all match data: details, lineups, statistics, and commentary in one go.
@@ -617,7 +728,7 @@ def fetch_complete_match_data(
                 "passes": game.get("awayPasses"),
                 "pass_accuracy": game.get("awayPassAccuracy"),
             },
-            "minute": int(game.get("gameTime", 0) or 0)
+            "minute": int(game.get("gameTime", 0) or 0),
         },
         "commentary": game.get("commentary", []),
         "score": {

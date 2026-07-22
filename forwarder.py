@@ -208,6 +208,88 @@ class Forwarder:
     # COMMENTARY
     # ============================================================
 
+    def _format_timestamp(self, ts) -> str:
+        """Plain ISO-8601 string with millisecond precision and a Z
+        suffix, e.g. "2026-07-19T19:18:33.823Z". Used as the value
+        wrapped by _format_bson_date() below -- never sent bare for
+        commentary, since CommentaryEntry.created_at needs the Extended
+        JSON shape (see _format_bson_date's docstring)."""
+        if ts is None:
+            return (
+                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+            )
+        if isinstance(ts, datetime):
+            return ts.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        if isinstance(ts, str):
+            ts = ts.replace("+00:00", "Z")
+            if "." not in ts:
+                ts = ts.replace("Z", "").replace("+00:00", "")
+                ts = ts + ".000Z"
+            if not ts.endswith("Z") and "+" not in ts:
+                ts = ts + "Z"
+            return ts
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+    def _format_bson_date(self, ts) -> Dict[str, str]:
+        """
+        MongoDB Extended JSON date wrapper, e.g. {"$date": "2026-07-19T19:18:33.823Z"}.
+
+        CommentaryEntry.created_at (models/game.rs) is typed
+        `#[serde(rename = "createdAt")] pub created_at: BsonDateTime` --
+        mongodb::bson::DateTime, NOT chrono::DateTime and NOT a plain
+        String. When Axum's Json extractor deserializes a request body
+        into that field, it's going through serde_json (the body is
+        plain JSON, not real BSON), and bson::DateTime's Deserialize impl
+        for self-describing formats only accepts the relaxed/canonical
+        Extended JSON date shape -- {"$date": "<ISO-8601>"} -- not a bare
+        string. Sending a bare string here 422s the whole request before
+        the handler code (which overwrites created_at server-side anyway)
+        ever runs.
+
+        Contrast with forward_live_update() above, which sends
+        "timestamp" as a bare ISO string and works fine -- that's because
+        LiveGameUpdate.timestamp is `Option<chrono::DateTime<Utc>>`,
+        which DOES accept a bare RFC3339 string. Don't wrap that one the
+        same way, or it'll break instead.
+        """
+        return {"$date": self._format_timestamp(ts)}
+
+    def _normalize_commentary_entry(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Build a commentary entry matching CommentaryEntry exactly:
+        { minute: i32, text: String, type: String, team: Option<String>,
+          player: Option<String>, createdAt: BsonDateTime }.
+
+        This forwarder previously passed entries straight through
+        untouched in forward_commentary/forward_commentary_bulk, trusting
+        the caller to have already shaped them correctly -- but nothing
+        upstream was wrapping createdAt as Extended JSON, so every
+        commentary POST 422'd. Normalizing here, at the forwarder
+        boundary, means it's fixed regardless of what shape the caller's
+        entry dict is in.
+        """
+        try:
+            minute = int(entry.get("minute", 0))
+        except (ValueError, TypeError):
+            minute = 0
+
+        text = str(entry.get("text", ""))
+
+        event_type = entry.get("type") or entry.get("event_type") or "commentary"
+        event_type = str(event_type)
+
+        created_at = entry.get("createdAt") or entry.get("created_at")
+        created_at = self._format_bson_date(created_at)
+
+        return {
+            "minute": minute,
+            "text": text,
+            "type": event_type,
+            "team": entry.get("team"),
+            "player": entry.get("player"),
+            "createdAt": created_at,
+        }
+
     def forward_commentary(self, commentary: Dict[str, Any]) -> bool:
         """
         Forward commentary to the Rust API.
@@ -225,7 +307,11 @@ class Forwarder:
             }
         }
         """
-        return self._post("/games/commentary", commentary)
+        payload = {
+            "match_id": commentary.get("match_id"),
+            "entry": self._normalize_commentary_entry(commentary.get("entry", {})),
+        }
+        return self._post("/games/commentary", payload)
 
     def forward_commentary_bulk(
         self, fixture_id: str, entries: List[Dict[str, Any]]
@@ -233,7 +319,8 @@ class Forwarder:
         """
         Forward multiple commentary entries for a fixture.
         """
-        payload = {"match_id": fixture_id, "entries": entries}
+        normalized = [self._normalize_commentary_entry(e) for e in entries]
+        payload = {"match_id": fixture_id, "entries": normalized}
         return self._post("/games/commentary/bulk", payload)
 
     # ============================================================
