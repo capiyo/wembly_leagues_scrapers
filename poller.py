@@ -910,17 +910,21 @@ class Poller:
         self.forwarder.forward_live_update(live_update)
 
     def _trigger_rescrape(self, reason: str = ""):
-        """Re-run league fixture discovery so a freshly-archived slot in
-        `games` gets refilled with upcoming league matches right away,
+        """Re-run league AND friendlies fixture discovery so a
+        freshly-archived slot in `games` gets refilled right away,
         instead of waiting for the next scheduled backstop.
 
-        Leagues-only, rolling window: calls
-        leagues_scraper.scrape_all_leagues_window(), which upserts only
-        fixtures kicking off within config.SCRAPE_DAYS_AHEAD days (7 by
-        default) for every league in config.LEAGUES. A league whose
-        season hasn't started yet simply upserts nothing until its first
-        fixture falls inside that window -- no separate "has the season
-        started" check is needed.
+        Rolling window, both halves:
+          - leagues_scraper.scrape_all_leagues_window() -- upserts league
+            fixtures kicking off within config.REFERENCE_WINDOW_DAYS days
+            (13 by default) for every league in config.LEAGUES. A league
+            whose season hasn't started yet simply upserts nothing until
+            its first fixture falls inside that window.
+          - leagues_scraper.scrape_all_friendlies_window() -- upserts
+            Club Friendlies (competitionId=321, filtered to EPL/Serie A
+            clubs) kicking off within config.FRIENDLIES_WINDOW_DAYS days
+            (10 by default) from TODAY -- no season-start dead zone to
+            skip since friendlies are being played right now.
 
         World Cup scraping (scraper.scrape_world_cup_fixtures) has been
         removed from this path entirely.
@@ -939,10 +943,25 @@ class Poller:
             )
             total = sum(results.values())
             logger.info(
-                f"✅ Rescrape complete: {results} (total={total} fixtures upserted)"
+                f"✅ League rescrape complete: {results} (total={total} fixtures upserted)"
             )
         except Exception as e:
-            logger.error(f"❌ Rescrape failed: {e}")
+            logger.error(f"❌ League rescrape failed: {e}")
+
+        try:
+            logger.info(f"🔄 Triggering friendlies rescrape ({reason})...")
+            friendlies_results = leagues_scraper.scrape_all_friendlies_window(
+                self.store,
+                days_ahead=config.FRIENDLIES_WINDOW_DAYS,
+                forwarder=self.forwarder,
+            )
+            friendlies_total = sum(friendlies_results.values())
+            logger.info(
+                f"✅ Friendlies rescrape complete: {friendlies_results} "
+                f"(total={friendlies_total} fixtures upserted)"
+            )
+        except Exception as e:
+            logger.error(f"❌ Friendlies rescrape failed: {e}")
 
     def _finalize_match_result(self, match: Dict[str, Any]):
         match_id = match.get("matchId")

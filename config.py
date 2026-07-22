@@ -92,7 +92,7 @@ LEAGUES = {
 # day (see FixtureStore.advance_reference_date_if_needed). Chosen to
 # roughly line up with Community Shield / EPL preseason buildup.
 REFERENCE_DATE_DEFAULT = "2026-08-13"
-REFERENCE_WINDOW_DAYS = 11
+REFERENCE_WINDOW_DAYS = 13
 
 # Order matters here -- this is also the priority order used when
 # building the "top of feed" response (EPL first, down to Community
@@ -195,6 +195,17 @@ SERIEA_CLUB_NAMES = [
 # window once this one has passed.
 FRIENDLIES_DEFAULT_START_DATE = "2026-07-25"
 FRIENDLIES_DEFAULT_RANGE_DAYS = 10
+
+# Rolling window size (in days) for scrape_friendlies_window() /
+# scrape_all_friendlies_window() -- the automatic path wired into
+# poller.py's _trigger_rescrape() and used by leagues_scraper.py's
+# default (no-flags) run. Unlike FRIENDLIES_DEFAULT_START_DATE above,
+# this window always anchors on the REAL current date each time it
+# runs (no fixed seed date, no pre-season dead-zone skip like leagues'
+# REFERENCE_DATE_DEFAULT) -- friendlies are being played right now, so
+# there's no "hasn't started yet" case to guard against the way league
+# season openers need.
+FRIENDLIES_WINDOW_DAYS = 10
 
 FRIENDLIES = {
     "epl_friendlies": {
