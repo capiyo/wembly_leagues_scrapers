@@ -507,8 +507,17 @@ class Poller:
         if self.state_machine.should_fetch_lineups(
             match, current_status, minutes_to_kickoff
         ):
-            self._fetch_and_forward_lineups(match)
-            self.state_machine.mark_lineups_done(match_id)
+            # THE BUG: this used to call mark_lineups_done() unconditionally
+            # right after the attempt, regardless of whether lineups were
+            # actually available yet. 365Scores frequently hasn't published
+            # a friendly's lineups by the time the first "soon"/"live" poll
+            # hits it -- that single miss permanently added match_id to
+            # self.state_machine.lineups_fetched (an in-memory set, checked
+            # by should_fetch_lineups() above), so every later cycle skipped
+            # the fetch forever even once 365Scores actually had the data.
+            # Only lock out retries when the fetch+forward genuinely succeeded.
+            if self._fetch_and_forward_lineups(match):
+                self.state_machine.mark_lineups_done(match_id)
 
         if current_status == "live":
             self._fetch_live_updates(match)
@@ -594,7 +603,15 @@ class Poller:
             "players": team_lineup.get("members", []),
         }
 
-    def _fetch_and_forward_lineups(self, match: Dict[str, Any]):
+    def _fetch_and_forward_lineups(self, match: Dict[str, Any]) -> bool:
+        """Fetch + forward lineups for one match. Returns True only when
+        lineups were actually available AND successfully forwarded --
+        the caller uses this to decide whether it's safe to stop
+        retrying (see mark_lineups_done() call site in _process_match).
+        Every early-return / failure path below returns False so a
+        transient miss (365Scores hasn't published lineups yet, or the
+        forward to the Rust API failed) gets tried again on the next
+        poll cycle instead of being silently abandoned forever."""
         match_id = match.get("matchId")
         game_id = match.get("threesixtyfiveGameId")
         away_id = match.get("away_competitor_id")
@@ -607,7 +624,7 @@ class Poller:
             logger.warning(
                 f"Missing competitor IDs for {match_id}, cannot fetch lineups"
             )
-            return
+            return False
 
         logger.info(f"📋 Fetching lineups for {match_id}...")
 
@@ -636,13 +653,17 @@ class Poller:
                 if success:
                     self.store.mark_lineups_fetched(match_id)
                     logger.info(f"✅ Lineups fetched and forwarded for {match_id}")
+                    return True
                 else:
                     logger.warning(f"⚠️ Failed to forward lineups for {match_id}")
+                    return False
             else:
                 logger.debug(f"No lineups available yet for {match_id}")
+                return False
 
         except Exception as e:
             logger.error(f"❌ Failed to fetch lineups for {match_id}: {e}")
+            return False
 
     def _fetch_and_forward_statistics(
         self,

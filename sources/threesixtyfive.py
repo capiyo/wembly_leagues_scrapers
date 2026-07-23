@@ -1,6 +1,14 @@
 """
-365Scores API client for World Cup data.
+365Scores API client for league, friendly, and World Cup/international data.
 Fetches: fixtures, live scores, events, lineups, statistics, and commentary.
+
+NOTE: This is the league-scraper's copy of the module and had drifted from
+the World Cup poller's copy -- it was missing the shared _fetch_play_by_play_raw
+helper and, worse, fetch_commentary() hardcoded "team": None instead of
+resolving CompetitorNum the way fetch_match_events() already did. Both are
+fixed below by mirroring the World Cup version's structure exactly. The
+league-only additions (fetch_games_by_date_range, filter_games_by_club_names)
+are kept as-is since the World Cup version doesn't need them.
 """
 
 from __future__ import annotations
@@ -454,6 +462,12 @@ def fetch_statistics(
 # by extract_statistics_from_game() (homeCorners, homeYellowCards, ...)
 # have no per-event breakdown.
 #
+# THIS SHARED HELPER WAS MISSING from the league version of this file --
+# fetch_commentary() and fetch_match_events() each duplicated their own
+# raw fetch instead of sharing one. Restored to match the World Cup
+# version so both functions stay consistent and only need one network
+# call's worth of logic to maintain.
+#
 # Two things the raw feed gets wrong that we correct here:
 #   1. The feedURL 365Scores returns comes pre-built with lang=37
 #      (Dutch), not English -- every other endpoint in this file uses
@@ -574,6 +588,9 @@ def fetch_commentary(
                 "minute": minute,
                 "text": text,
                 "type": entry.get("TypeName", "commentary"),
+                # FIX: this was hardcoded to None in the league version --
+                # restored to actually resolve the side via CompetitorNum,
+                # same as fetch_match_events() already did correctly.
                 "team": _competitor_num_to_side(entry.get("CompetitorNum")),
                 "player": player,
             }
