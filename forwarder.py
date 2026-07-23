@@ -554,6 +554,37 @@ class Forwarder:
         """
         return self._post(f"/games/{fixture_id}/move-to-history", {})
 
+    def settle_bets(self, fixture_id: str, result: str) -> bool:
+        """
+        Settle all straight-up (moneyline) bets for a completed match.
+
+        THIS METHOD WAS MISSING -- poller.py's _settle_and_complete_match()
+        and the max-retries fallback in _fetch_live_updates() both call
+        self.forwarder.settle_bets(match_id, result) unconditionally the
+        moment a match reaches full-time. With this method absent, that
+        call raised AttributeError on EVERY completed match -- not a
+        caught/logged failure, an unhandled exception that aborted
+        _process_match() before update_status(..., "completed") or
+        move_to_history() ever ran. poll_once()'s per-match try/except
+        swallowed it and logged an error, so the poller kept running and
+        looked "fine" in the logs, but no match ever finished archiving.
+
+        Args:
+            fixture_id: The match id (e.g. "epl_4627864" or
+                "epl_friendly_4627864").
+            result: "home", "away", or "draw".
+        """
+        if result not in ("home", "away", "draw"):
+            logger.error(f"Invalid result for settlement: {result!r}")
+            return False
+
+        payload = {
+            "fixture_id": fixture_id,
+            "result": result,
+        }
+        logger.info(f"💰 Settling bets for {fixture_id} with result: {result}")
+        return self._post("/actions/bet/settle", payload)
+
     # ============================================================
     # SUB-FIXTURE MARKETS
     # ============================================================
@@ -611,6 +642,55 @@ class Forwarder:
                 all_ok = False
 
         return all_ok
+
+    def settle_sub_fixture_market(
+        self, match_id: str, market_id: str, result: str
+    ) -> bool:
+        """
+        Settle one sub-fixture market (first_goal / first_card /
+        first_corner / over_under_2_5) with its outcome.
+
+        THIS METHOD WAS ALSO MISSING, same class of bug as settle_bets
+        above. poller.py calls this from TWO places, both unguarded:
+          - _check_first_event_markets(), fired on EVERY live poll the
+            moment a first goal/card/corner appears in the play-by-play
+            feed. Without this method, the very first qualifying event
+            in ANY live match raised AttributeError, which aborted
+            _process_match() for that fixture BEFORE it ever reached
+            _fetch_commentary() later in the same method (fetch_commentary
+            is called after fetch_live_updates in poller.py's
+            _process_match). Since the crash reproduces identically on
+            every subsequent poll cycle for that same fixture, commentary
+            (and, for matches where the crash happens before halftime,
+            statistics too) silently stopped forever for that match, not
+            just for one cycle.
+          - _settle_over_under_market(), called unconditionally as part
+            of match completion -- so even a 0-0 match with no
+            goal/card/corner event at all still hit this same missing
+            method at full-time, blocking settle_bets/move_to_history
+            from ever running for it.
+
+        ASSUMPTION (unconfirmed, same caveat as create_sub_fixture_market's
+        endpoint): mirrors that method's
+        "/sub_fixtures/sub-fixture/market/create" path with "/settle"
+        swapped in. Confirm this matches the actual Rust route and adjust
+        if not -- if it 404s, this will fail loudly via _post's logging
+        (payload + response body), not silently.
+
+        Args:
+            match_id: The match id.
+            market_id: One of MARKET_ID_FIRST_GOAL, MARKET_ID_FIRST_CARD,
+                MARKET_ID_FIRST_CORNER, MARKET_ID_OVER_UNDER_2_5 (see
+                poller.py's module-level constants).
+            result: The settlement outcome -- "home"/"away" for the
+                first_* markets, "over"/"under" for over_under_2_5.
+        """
+        payload = {
+            "match_id": match_id,
+            "market_id": market_id,
+            "result": result,
+        }
+        return self._post("/sub_fixtures/sub-fixture/market/settle", payload)
 
     # ============================================================
     # NOTIFICATIONS
