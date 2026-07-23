@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import re
 import requests
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger("worldcup_poller.sources.threesixtyfive")
@@ -136,31 +137,25 @@ def fetch_games_by_competition(
         return None
 
 
-def fetch_games_by_date_range(
+def _fetch_games_for_single_date(
     competition_ids: List[int],
-    start_date: str,
-    end_date: str,
+    date_str: str,
     timezone_name: str = "Africa/Nairobi",
     user_country_id: int = 413,
     show_odds: bool = True,
 ) -> Optional[List[Dict[str, Any]]]:
-    """
-    Same endpoint as fetch_games_by_competition, but scoped to a date
-    window via startDate/endDate. Needed for Club Friendlies
-    (competitionId=321): that single competition pools every friendly
-    for 6000+ clubs worldwide, so fetching it without a date bound
-    would return a huge, mostly-irrelevant payload. startDate/endDate
-    are accepted by the same /web/games/fixtures/ endpoint used in
-    fetch_games_by_competition -- both params are "YYYY-MM-DD".
-    """
+    """One day's worth of games for the given competitions. Internal
+    helper for fetch_games_by_date_range() -- see that function's
+    docstring for why this loops per-day instead of trusting a
+    startDate/endDate range in a single request."""
     params = {
         "appTypeId": 5,
         "langId": 1,
         "timezoneName": timezone_name,
         "userCountryId": user_country_id,
         "competitions": ",".join(str(cid) for cid in competition_ids),
-        "startDate": start_date,
-        "endDate": end_date,
+        "startDate": date_str,
+        "endDate": date_str,
         "showOdds": str(show_odds).lower(),
         "includeTopBettingOpportunity": "1",
         "topBookmaker": "14",
@@ -175,19 +170,96 @@ def fetch_games_by_date_range(
 
         data = response.json()
         games = data.get("games", [])
-        logger.info(
-            f"fetch_games_by_date_range({competition_ids}, {start_date}..{end_date}): "
-            f"{len(games)} games returned"
-        )
-
+        logger.debug(f"_fetch_games_for_single_date({competition_ids}, {date_str}): {len(games)} games")
         return games
 
     except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch games from 365Scores: {e}")
+        logger.error(f"Failed to fetch games from 365Scores for {date_str}: {e}")
         return None
     except ValueError as e:
-        logger.error(f"Failed to parse JSON response: {e}")
+        logger.error(f"Failed to parse JSON response for {date_str}: {e}")
         return None
+
+
+def fetch_games_by_date_range(
+    competition_ids: List[int],
+    start_date: str,
+    end_date: str,
+    timezone_name: str = "Africa/Nairobi",
+    user_country_id: int = 413,
+    show_odds: bool = True,
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    Games across a date window, for Club Friendlies (competitionId=321):
+    that single competition pools every friendly for 6000+ clubs
+    worldwide, so fetching it without a date bound would return a huge,
+    mostly-irrelevant payload.
+
+    IMPLEMENTATION NOTE: this used to make ONE request to
+    /web/games/fixtures/ with startDate/endDate set to the full window
+    and rely on 365Scores honoring that range. In practice, when a
+    `competitions` filter is present alongside startDate/endDate, the
+    endpoint appears to silently ignore the range and just return
+    "today" -- observed as friendlies scrapes configured for a 7-10 day
+    window only ever returning that day's fixtures. To sidestep that
+    quirk entirely rather than depend on whichever way 365Scores
+    happens to be behaving, this now issues one request PER DAY in
+    [start_date, end_date] (inclusive) via _fetch_games_for_single_date()
+    and merges the results, deduping by game id -- a fixture appearing
+    in more than one day's response (shouldn't normally happen, but
+    cheap to guard against) is only kept once.
+
+    start_date/end_date are both "YYYY-MM-DD". Costs len(date range)
+    requests instead of 1 -- for the typical 7-10 day friendlies window
+    that's 7-10 calls, which is a non-issue at the polling intervals
+    this is used at.
+    """
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError as e:
+        logger.error(f"fetch_games_by_date_range: bad date format ({start_date}..{end_date}): {e}")
+        return None
+
+    if end_dt < start_dt:
+        logger.error(f"fetch_games_by_date_range: end_date {end_date} is before start_date {start_date}")
+        return None
+
+    seen_ids = set()
+    merged: List[Dict[str, Any]] = []
+    any_success = False
+
+    day = start_dt
+    while day <= end_dt:
+        date_str = day.strftime("%Y-%m-%d")
+        day_games = _fetch_games_for_single_date(
+            competition_ids,
+            date_str,
+            timezone_name=timezone_name,
+            user_country_id=user_country_id,
+            show_odds=show_odds,
+        )
+        if day_games is not None:
+            any_success = True
+            for game in day_games:
+                gid = game.get("id")
+                if gid is not None and gid in seen_ids:
+                    continue
+                if gid is not None:
+                    seen_ids.add(gid)
+                merged.append(game)
+        day += timedelta(days=1)
+
+    if not any_success:
+        # Every single day's request failed (network/API error) -- return
+        # None so callers can distinguish "API down" from "API up, 0 games".
+        return None
+
+    logger.info(
+        f"fetch_games_by_date_range({competition_ids}, {start_date}..{end_date}): "
+        f"{len(merged)} games returned across {(end_dt - start_dt).days + 1} day(s)"
+    )
+    return merged
 
 
 def filter_games_by_club_names(
