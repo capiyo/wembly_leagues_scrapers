@@ -401,55 +401,29 @@ def scrape_league_fixtures_window(
     if reference_override is not None:
         reference = reference_override
         logger.info(
-            "%s: using shared reference date %s (override, not the per-league heuristic)",
+            "%s: using shared reference date %s (override)",
             league_cfg["name"],
             reference.strftime("%Y-%m-%d"),
         )
     else:
-        # Reference point for the window -- NOT always "today". Two cases
-        # where we deliberately anchor elsewhere:
-        #
-        # 1. This league has already been seeded ahead of "today" by a
-        #    previous windowed scrape (last_kickoff > now). Anchor on that
-        #    high-water mark instead of "now" so each poller trigger (the
-        #    twice-daily backstop, or the reactive rescrape after a match
-        #    archives) advances the window forward from where the LAST scrape
-        #    left off, rather than re-checking the same near-term slice
-        #    relative to today over and over.
-        #
-        # 2. Nothing usable has been scraped yet and the league's own season
-        #    hasn't started within the normal `days_ahead` window (e.g. it's
-        #    July and the EPL doesn't open until August 21). Anchor on the
-        #    competition's own earliest upcoming kickoff -- its real start
-        #    date -- so the opening batch of fixtures gets seeded as soon as
-        #    365Scores has published them, instead of silently doing nothing
-        #    until we happen to be within `days_ahead` of kickoff.
-        last_kickoff = store.get_latest_kickoff_for_league(league_key)
-
-        if last_kickoff and last_kickoff > now:
-            reference = last_kickoff
-            logger.info(
-                "%s: continuing rolling window from last-scraped kickoff %s (not today)",
-                league_cfg["name"],
-                reference.strftime("%Y-%m-%d %H:%M"),
-            )
-        else:
-            not_finished = [g for g in games if not threesixtyfive.is_game_finished(g)]
-            earliest_kickoff = min(
-                (_parse_kickoff(g.get("startTime")) for g in not_finished),
-                default=None,
-            )
-            if earliest_kickoff and earliest_kickoff > now + datetime.timedelta(
-                days=days_ahead
-            ):
-                reference = earliest_kickoff
-                logger.info(
-                    "%s hasn't started yet -- anchoring window on season start %s instead of today",
-                    league_cfg["name"],
-                    reference.strftime("%Y-%m-%d %H:%M"),
-                )
-            else:
-                reference = now
+        # Anchor strictly on TODAY -- same convention as
+        # scrape_friendlies_window(), per explicit request: both leagues
+        # and friendlies now use one unified window (config.SCRAPE_WINDOW_DAYS,
+        # 13 days), referenced from today, every time this runs. This
+        # replaces the previous heuristic that anchored on
+        # store.get_latest_kickoff_for_league() (continue from wherever
+        # the last scrape left off) or the competition's own earliest
+        # upcoming kickoff (skip a pre-season dead zone) -- both of those
+        # existed to avoid re-scraping the same near-term slice
+        # repeatedly while a season was still weeks away, but they also
+        # meant a competition like `comp3645` that gets added to LEAGUES
+        # without ever having been scraped before would need its own
+        # bootstrapping logic to start rolling forward. Anchoring on
+        # "today" unconditionally has no such bootstrapping gap: every
+        # call, for every league, always asks 365Scores for exactly
+        # "what's within the next N days from right now," which is also
+        # simpler to reason about when several leagues are wired in.
+        reference = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
     cutoff = reference + datetime.timedelta(days=days_ahead)
 
@@ -727,7 +701,7 @@ def scrape_friendlies_window(
     competition_id = friendly_cfg["competition_id"]
     club_names = friendly_cfg["club_names"]
 
-    days_ahead = config.FRIENDLIES_WINDOW_DAYS if days_ahead is None else days_ahead
+    days_ahead = config.SCRAPE_WINDOW_DAYS if days_ahead is None else days_ahead
 
     today = datetime.datetime.now(datetime.timezone.utc).date()
     end_date = today + datetime.timedelta(days=days_ahead)
@@ -804,20 +778,26 @@ def scrape_all_friendlies_window(
 
 
 def scrape_all_leagues_window(
-    store: FixtureStore, days_ahead: int = 7, forwarder: Optional[Forwarder] = None
+    store: FixtureStore,
+    days_ahead: int = config.SCRAPE_WINDOW_DAYS,
+    forwarder: Optional[Forwarder] = None,
 ) -> dict[str, int]:
     """Windowed version of scrape_all_leagues -- this is what poller.py
     calls automatically (on the reactive post-match-completion trigger
     and the twice-daily scheduled backstop). Returns {league_key: count}.
 
-    Every call through here advances the shared reference date by one
-    day, but only on the FIRST call of any given real calendar day --
-    store.advance_reference_date_if_needed() enforces that atomically,
-    so it doesn't matter whether this fires once or a dozen times today
-    (e.g. several matches completing back-to-back)."""
-    reference = store.advance_reference_date_if_needed()
+    Anchors on TODAY for every league, every call -- no more shared
+    "reference date" state (store.advance_reference_date_if_needed() is
+    no longer called here). See the comment in
+    scrape_league_fixtures_window() for why: one unified rule (today +
+    config.SCRAPE_WINDOW_DAYS, 13 by default) for every league, with no
+    separate bootstrapping needed when a new competition (e.g.
+    `comp3645`) is added to config.LEAGUES."""
+    reference = datetime.datetime.now(datetime.timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
     logger.info(
-        "scrape_all_leagues_window: shared reference date = %s, window = %d days",
+        "scrape_all_leagues_window: reference date = %s (today), window = %d days",
         reference.strftime("%Y-%m-%d"),
         days_ahead,
     )
@@ -1000,10 +980,10 @@ def main() -> None:
                 )
             else:
                 league_results = scrape_all_leagues_window(
-                    store, days_ahead=config.REFERENCE_WINDOW_DAYS, forwarder=forwarder
+                    store, days_ahead=config.SCRAPE_WINDOW_DAYS, forwarder=forwarder
                 )
                 friendlies_results = scrape_all_friendlies_window(
-                    store, days_ahead=config.FRIENDLIES_WINDOW_DAYS, forwarder=forwarder
+                    store, days_ahead=config.SCRAPE_WINDOW_DAYS, forwarder=forwarder
                 )
                 league_total = sum(league_results.values())
                 friendlies_total = sum(friendlies_results.values())
@@ -1013,10 +993,10 @@ def main() -> None:
                     "today) = grand total %d upserted into '%s' collection.",
                     league_results,
                     league_total,
-                    config.REFERENCE_WINDOW_DAYS,
+                    config.SCRAPE_WINDOW_DAYS,
                     friendlies_results,
                     friendlies_total,
-                    config.FRIENDLIES_WINDOW_DAYS,
+                    config.SCRAPE_WINDOW_DAYS,
                     league_total + friendlies_total,
                     config.MONGO_COLLECTION,
                 )
@@ -1032,7 +1012,7 @@ def main() -> None:
                 count = scrape_league_fixtures_window(
                     store,
                     args.league,
-                    days_ahead=config.REFERENCE_WINDOW_DAYS,
+                    days_ahead=config.SCRAPE_WINDOW_DAYS,
                     forwarder=forwarder,
                 )
                 logger.info(

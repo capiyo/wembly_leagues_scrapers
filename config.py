@@ -38,6 +38,19 @@ WORLD_CUP_COMPETITION_IDS = [5930]
 SCRAPE_DAYS_AHEAD = 7
 
 # ============================================================
+# UNIFIED SCRAPE WINDOW (leagues AND friendlies, both anchored on today)
+# ============================================================
+# Single shared window size, in days, used by BOTH
+# scrape_all_leagues_window() and scrape_all_friendlies_window() in
+# leagues_scraper.py -- both now anchor strictly on "today"
+# (datetime.now(UTC).date()), no reference-date creep/high-water-mark
+# heuristics. Replaces the old split of REFERENCE_WINDOW_DAYS (13, for
+# leagues) vs FRIENDLIES_WINDOW_DAYS (10, for friendlies) with one
+# number applied identically to both, per explicit request: "13 days
+# for both friendlies and leagues, referenced from today, all of them."
+SCRAPE_WINDOW_DAYS = 13
+
+# ============================================================
 # LEAGUE-BASED FIXTURES (leagues_scraper.py)
 # ============================================================
 # 365Scores competitionId for each league/cup, derived from each
@@ -81,16 +94,41 @@ LEAGUES = {
         "name": "Community Shield",
         "prefix": "community_shield",
     },
+    # ADDED: competitionId 3645 -- this is the competition that used to
+    # be scraped by the now-deleted standalone scraper.py, but was never
+    # migrated into this dict when leagues_scraper.py took over as the
+    # sole scrape path. Since it wasn't in LEAGUES or FRIENDLIES, nothing
+    # in the automatic rolling-window scrape (poller.py's
+    # _trigger_rescrape -> scrape_all_leagues_window) ever picked it up
+    # for new fixtures -- whatever was in `games` for it was a one-time
+    # leftover from before scraper.py was removed, never refreshed.
+    #
+    # NAME/PREFIX BELOW ARE PLACEHOLDERS -- confirm the competition's
+    # real name (check https://www.365scores.com/football/league/<slug>-3645)
+    # and rename both "name" and "prefix" accordingly. Leaving "prefix"
+    # as "comp3645" works functionally (matchIds will just look like
+    # "comp3645_<gameId>") but a real prefix is clearer in the database.
+    "comp3645": {
+        "competition_id": 3645,
+        "name": "Competition 3645",
+        "prefix": "comp3645",
+    },
 }
 
 # ============================================================
-# PRIORITY-LEAGUE ROLLING WINDOW
+# PRIORITY-LEAGUE ROLLING WINDOW (legacy -- see SCRAPE_WINDOW_DAYS)
 # ============================================================
 # Instead of anchoring the scrape window on "now" (a dead zone until the
-# priority leagues' seasons actually start), we anchor on a reference
-# date that starts here and creeps forward by one day per real calendar
-# day (see FixtureStore.advance_reference_date_if_needed). Chosen to
-# roughly line up with Community Shield / EPL preseason buildup.
+# priority leagues' seasons actually start), this used to anchor on a
+# reference date that starts here and creeps forward by one day per real
+# calendar day (see FixtureStore.advance_reference_date_if_needed).
+#
+# NO LONGER USED by scrape_all_leagues_window() -- leagues now anchor on
+# today directly, same as friendlies, per SCRAPE_WINDOW_DAYS above. Left
+# in place only because mongo_store.FixtureStore.get_reference_date() /
+# advance_reference_date_if_needed() still reference these constants;
+# harmless dead weight now that nothing calls those methods from the
+# scrape path.
 REFERENCE_DATE_DEFAULT = "2026-08-13"
 REFERENCE_WINDOW_DAYS = 13
 
@@ -192,19 +230,19 @@ SERIEA_CLUB_NAMES = [
 # Default friendlies window: 10 days starting 2026-07-26, per the
 # pre-season friendly slate requested when this was set up. Override
 # with --start-date/--days on leagues_scraper.py's CLI for any later
-# window once this one has passed.
+# window once this one has passed. Only used by scrape_friendlies()
+# (the fixed-date-range variant) -- the rolling scrape_friendlies_window()
+# now defaults to SCRAPE_WINDOW_DAYS from today instead.
 FRIENDLIES_DEFAULT_START_DATE = "2026-07-25"
 FRIENDLIES_DEFAULT_RANGE_DAYS = 10
 
 # Rolling window size (in days) for scrape_friendlies_window() /
-# scrape_all_friendlies_window() -- the automatic path wired into
-# poller.py's _trigger_rescrape() and used by leagues_scraper.py's
-# default (no-flags) run. Unlike FRIENDLIES_DEFAULT_START_DATE above,
-# this window always anchors on the REAL current date each time it
-# runs (no fixed seed date, no pre-season dead-zone skip like leagues'
-# REFERENCE_DATE_DEFAULT) -- friendlies are being played right now, so
-# there's no "hasn't started yet" case to guard against the way league
-# season openers need.
+# scrape_all_friendlies_window(). Superseded by SCRAPE_WINDOW_DAYS above
+# for the automatic path (poller.py's _trigger_rescrape and
+# leagues_scraper.py's default no-flags run both now pass
+# SCRAPE_WINDOW_DAYS explicitly) -- kept only as the fallback default on
+# scrape_friendlies_window()'s days_ahead parameter for direct/manual
+# calls that don't pass one.
 FRIENDLIES_WINDOW_DAYS = 10
 
 FRIENDLIES = {
