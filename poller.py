@@ -935,17 +935,21 @@ class Poller:
         freshly-archived slot in `games` gets refilled right away,
         instead of waiting for the next scheduled backstop.
 
-        Rolling window, both halves:
+        Rolling window, both halves, now sharing ONE unified window size
+        (config.SCRAPE_WINDOW_DAYS, 13 by default) referenced from today
+        for both -- previously leagues used a separate reference-date
+        high-water-mark heuristic (config.REFERENCE_WINDOW_DAYS) and
+        friendlies used a plain today+N window at a different size
+        (config.FRIENDLIES_WINDOW_DAYS); both now behave identically:
           - leagues_scraper.scrape_all_leagues_window() -- upserts league
-            fixtures kicking off within config.REFERENCE_WINDOW_DAYS days
-            (13 by default) for every league in config.LEAGUES. A league
-            whose season hasn't started yet simply upserts nothing until
-            its first fixture falls inside that window.
+            fixtures kicking off within config.SCRAPE_WINDOW_DAYS days of
+            today, for every league in config.LEAGUES (including
+            comp3645, which previously had no scrape path at all -- see
+            config.py's comment on that entry).
           - leagues_scraper.scrape_all_friendlies_window() -- upserts
             Club Friendlies (competitionId=321, filtered to EPL/Serie A
-            clubs) kicking off within config.FRIENDLIES_WINDOW_DAYS days
-            (10 by default) from TODAY -- no season-start dead zone to
-            skip since friendlies are being played right now.
+            clubs) kicking off within the same config.SCRAPE_WINDOW_DAYS
+            days of today.
 
         World Cup scraping (scraper.scrape_world_cup_fixtures) has been
         removed from this path entirely.
@@ -959,7 +963,7 @@ class Poller:
             logger.info(f"🔄 Triggering league rescrape ({reason})...")
             results = leagues_scraper.scrape_all_leagues_window(
                 self.store,
-                days_ahead=config.REFERENCE_WINDOW_DAYS,
+                days_ahead=config.SCRAPE_WINDOW_DAYS,
                 forwarder=self.forwarder,
             )
             total = sum(results.values())
@@ -973,7 +977,7 @@ class Poller:
             logger.info(f"🔄 Triggering friendlies rescrape ({reason})...")
             friendlies_results = leagues_scraper.scrape_all_friendlies_window(
                 self.store,
-                days_ahead=config.FRIENDLIES_WINDOW_DAYS,
+                days_ahead=config.SCRAPE_WINDOW_DAYS,
                 forwarder=self.forwarder,
             )
             friendlies_total = sum(friendlies_results.values())
