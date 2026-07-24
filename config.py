@@ -1,5 +1,9 @@
 """
-Central configuration for the World Cup live poller.
+Central configuration for the league + Club Friendlies live poller.
+
+SCOPE: leagues (config.LEAGUES) and Club Friendlies for those leagues'
+clubs (config.FRIENDLIES) only -- no World Cup, no other internationals.
+The old standalone World Cup scraper.py has been removed entirely.
 
 ARCHITECTURE:
 365Scores is the sole live data source — fixtures discovery, score, status,
@@ -34,7 +38,6 @@ THREESIXTYFIVE_TIMEZONE = "Africa/Nairobi"
 
 # Polling
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
-WORLD_CUP_COMPETITION_IDS = [5930]
 SCRAPE_DAYS_AHEAD = 7
 
 # ============================================================
@@ -93,25 +96,6 @@ LEAGUES = {
         "competition_id": 10,
         "name": "Community Shield",
         "prefix": "community_shield",
-    },
-    # ADDED: competitionId 3645 -- this is the competition that used to
-    # be scraped by the now-deleted standalone scraper.py, but was never
-    # migrated into this dict when leagues_scraper.py took over as the
-    # sole scrape path. Since it wasn't in LEAGUES or FRIENDLIES, nothing
-    # in the automatic rolling-window scrape (poller.py's
-    # _trigger_rescrape -> scrape_all_leagues_window) ever picked it up
-    # for new fixtures -- whatever was in `games` for it was a one-time
-    # leftover from before scraper.py was removed, never refreshed.
-    #
-    # NAME/PREFIX BELOW ARE PLACEHOLDERS -- confirm the competition's
-    # real name (check https://www.365scores.com/football/league/<slug>-3645)
-    # and rename both "name" and "prefix" accordingly. Leaving "prefix"
-    # as "comp3645" works functionally (matchIds will just look like
-    # "comp3645_<gameId>") but a real prefix is clearer in the database.
-    "comp3645": {
-        "competition_id": 3645,
-        "name": "Competition 3645",
-        "prefix": "comp3645",
     },
 }
 
