@@ -679,18 +679,35 @@ def scrape_friendlies_window(
     """Rolling-window counterpart to scrape_friendlies(): always anchors
     on the REAL current date (datetime.now(UTC).date()) rather than a
     fixed config.FRIENDLIES_DEFAULT_START_DATE, and spans
-    days_ahead (default config.FRIENDLIES_WINDOW_DAYS, 10) days from
-    there. This is what poller.py's _trigger_rescrape() calls
-    automatically after every match completes, and what
-    leagues_scraper.py's default (no-flags) run uses -- so "today" is
-    always whatever day it actually is when this runs, not a value
-    that goes stale once the originally-configured window passes.
+    days_ahead (default config.SCRAPE_WINDOW_DAYS, 13) days from there.
+    This is what poller.py's _trigger_rescrape() calls automatically
+    after every match completes, and what leagues_scraper.py's default
+    (no-flags) run uses -- so "today" is always whatever day it actually
+    is when this runs, not a value that goes stale once the
+    originally-configured window passes.
 
-    Unlike scrape_league_fixtures_window()'s reference-date dance
-    (skip-ahead-to-season-start, shared reference table, etc.),
-    friendlies don't need any of that: there's no pre-season dead zone
-    to skip over since friendlies ARE the pre-season, so a plain
-    "today + N days" is sufficient here.
+    REWRITTEN: this used to call threesixtyfive.fetch_games_by_date_range(),
+    which asks 365Scores for a startDate/endDate range on the
+    /web/games/fixtures/ endpoint. Confirmed against real logs: that
+    endpoint IGNORES startDate/endDate entirely for competitionId=321
+    (Club Friendlies) -- every day in a 14-day day-by-day loop returned
+    the exact same today-only result set, regardless of what date was
+    requested. No amount of date-param tuning fixes that; there's no
+    working date filter to loop over.
+
+    Instead this now uses the exact same pattern
+    scrape_league_fixtures_window() already uses successfully for every
+    league: threesixtyfive.fetch_games_by_competition() (competitions
+    filter only, NO date params at all) reliably returns that
+    competition's near-term slate of fixtures in one call (confirmed:
+    EPL alone returns 70 games spanning weeks ahead, not just today) --
+    then the date window is applied CLIENT-SIDE in Python against each
+    game's actual kickoff time, same as the league path already does.
+    Club Friendlies (competitionId=321) pools 6000+ clubs worldwide, so
+    this single unbounded fetch can be a much larger payload than a
+    single league's -- that's an acceptable, known tradeoff for
+    correctness over the alternative (a date filter that doesn't work
+    at all).
     """
     if friendly_key not in config.FRIENDLIES:
         raise ValueError(
@@ -703,46 +720,62 @@ def scrape_friendlies_window(
 
     days_ahead = config.SCRAPE_WINDOW_DAYS if days_ahead is None else days_ahead
 
-    today = datetime.datetime.now(datetime.timezone.utc).date()
-    end_date = today + datetime.timedelta(days=days_ahead)
-    start_date = today.strftime("%Y-%m-%d")
-    end_date_str = end_date.strftime("%Y-%m-%d")
-
     logger.info(
-        "Fetching %s from 365Scores (competitionId=%s, rolling window %s..%s, "
-        "%d days from today) ...",
+        "Fetching %s from 365Scores (competitionId=%s, unbounded fetch -- date "
+        "window of %d days from today applied client-side below) ...",
         friendly_cfg["name"],
         competition_id,
-        start_date,
-        end_date_str,
         days_ahead,
     )
 
-    games = threesixtyfive.fetch_games_by_date_range(
-        [competition_id], start_date=start_date, end_date=end_date_str
-    )
+    games = threesixtyfive.fetch_games_by_competition([competition_id])
 
     if games is None:
         logger.error(
-            "fetch_games_by_date_range(%s) returned None -- network/API error",
+            "fetch_games_by_competition(%s) returned None -- network/API error",
             competition_id,
         )
         return 0
 
     logger.info(
-        "365Scores returned %d raw Club Friendlies games for %s..%s (all clubs, unfiltered)",
+        "365Scores returned %d raw Club Friendlies games (all clubs worldwide, unfiltered)",
         len(games),
-        start_date,
-        end_date_str,
     )
 
-    club_games = threesixtyfive.filter_games_by_club_names(games, club_names)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff = today + datetime.timedelta(days=days_ahead)
+
+    in_window = []
+    for g in games:
+        kickoff = _parse_kickoff(g.get("startTime"))
+        is_live_now = _status_to_internal(g.get("statusText", "")) == "live"
+        # Same lower-bound convention as scrape_league_fixtures_window():
+        # compare calendar dates, not exact datetimes, and let an
+        # already-live match through even if its kickoff date is
+        # technically "yesterday" in UTC.
+        if kickoff.date() < today.date() and not is_live_now:
+            continue
+        if kickoff > cutoff:
+            continue
+        in_window.append(g)
 
     logger.info(
-        "%s: %d/%d fixtures involve a tracked club",
+        "%s: %d/%d fixtures fall within the %d-day window from %s (all clubs, unfiltered)",
+        friendly_cfg["name"],
+        len(in_window),
+        len(games),
+        days_ahead,
+        today.strftime("%Y-%m-%d"),
+    )
+
+    club_games = threesixtyfive.filter_games_by_club_names(in_window, club_names)
+
+    logger.info(
+        "%s: %d/%d in-window fixtures involve a tracked club",
         friendly_cfg["name"],
         len(club_games),
-        len(games),
+        len(in_window),
     )
 
     if not club_games:
