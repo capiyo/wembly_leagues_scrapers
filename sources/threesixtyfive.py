@@ -149,24 +149,27 @@ def _fetch_games_for_single_date(
     docstring for why this loops per-day instead of trusting a
     startDate/endDate range in a single request.
 
-    DELIBERATELY DOES NOT SEND `competitions` HERE. Evidence from a real
-    run: a 13-day Club Friendlies window that should have included many
-    documented EPL friendlies on Jul 25/26/28/29/30 and Aug 1/2 instead
-    only produced 2 EPL matches, both dated the day the scrape ran --
-    consistent with 365Scores ignoring startDate/endDate specifically
-    when a `competitions` filter is ALSO present, not just ignoring
-    ranges. This fetches that day's FULL schedule (no competitions
-    param) and filters down to competition_ids client-side instead, to
-    test/work around that theory directly. If this still only returns
-    today's games regardless of date_str, the date param is being
-    ignored outright by this endpoint and a different endpoint entirely
-    is needed -- see the caller's docstring for what that would mean.
+    REVERTED: a prior version of this dropped the `competitions` filter
+    to test whether 365Scores was ignoring startDate/endDate specifically
+    when combined with it -- that turned every one of the 13 daily
+    requests in a friendlies scrape into a fetch of EVERY football
+    fixture worldwide for that day instead of just Club Friendlies, a
+    much heavier/slower request run synchronously in the poll loop 13
+    times per scrape. That caused scraping to stall/time out entirely
+    (confirmed: manual deploy produced zero games). Reverted back to
+    sending `competitions` -- narrow, fast requests, same as before that
+    experiment. The date-match diagnostic below is kept since it's cheap
+    and still useful, but the untested "drop the filter" theory is not
+    worth another live outage to re-confirm; if the date-range quirk
+    needs revisiting, do it against a single manual/off-path call, not
+    inside the automatic scrape loop.
     """
     params = {
         "appTypeId": 5,
         "langId": 1,
         "timezoneName": timezone_name,
         "userCountryId": user_country_id,
+        "competitions": ",".join(str(cid) for cid in competition_ids),
         "startDate": date_str,
         "endDate": date_str,
         "showOdds": str(show_odds).lower(),
@@ -182,27 +185,20 @@ def _fetch_games_for_single_date(
         response.raise_for_status()
 
         data = response.json()
-        all_games = data.get("games", [])
+        games = data.get("games", [])
 
-        competition_id_set = set(competition_ids)
-        games = [g for g in all_games if g.get("competitionId") in competition_id_set]
-
-        # DIAGNOSTIC: how many of the returned (already competition-filtered)
-        # games actually kick off on date_str, vs some other date? If
-        # 365Scores is honoring startDate/endDate now that `competitions`
-        # is gone, this should be at or near 100% for every call. If it's
-        # still ignoring the date param outright, this stays low/0 on
-        # every date_str except the real today, on every call.
+        # DIAGNOSTIC: how many of the returned games actually kick off on
+        # date_str, vs some other date? Cheap to keep -- doesn't change
+        # what's requested, just reports on what came back.
         on_requested_date = sum(
             1 for g in games if (g.get("startTime") or "").startswith(date_str)
         )
         logger.info(
             f"_fetch_games_for_single_date({competition_ids}, requested={date_str}): "
-            f"{len(all_games)} total games that day (all competitions), "
-            f"{len(games)} matched competition_ids, "
-            f"{on_requested_date}/{len(games)} of those actually dated {date_str}"
+            f"{len(games)} games returned, {on_requested_date}/{len(games)} actually "
+            f"dated {date_str}"
             + (
-                " -- MISMATCH: 365Scores may still be ignoring the date param"
+                " -- MISMATCH: 365Scores may be ignoring the date param"
                 if games and on_requested_date == 0
                 else ""
             )
