@@ -1,9 +1,13 @@
 """
-Central configuration for the league + Club Friendlies live poller.
+Central configuration for the league live poller.
 
-SCOPE: leagues (config.LEAGUES) and Club Friendlies for those leagues'
-clubs (config.FRIENDLIES) only -- no World Cup, no other internationals.
-The old standalone World Cup scraper.py has been removed entirely.
+SCOPE: leagues (config.LEAGUES) only -- no World Cup, no other
+internationals, no Club Friendlies. The old standalone World Cup
+scraper.py has been removed entirely. Club Friendlies support (the
+EPL/Serie A club-name lists, the 6000+-club global competitionId, and
+the date-window scraping it required) has moved to the standalone
+`friendly_funtassy` service, which keeps its own config and writes into
+this same shared `games` collection.
 
 ARCHITECTURE:
 365Scores is the sole live data source — fixtures discovery, score, status,
@@ -41,16 +45,12 @@ POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
 SCRAPE_DAYS_AHEAD = 7
 
 # ============================================================
-# UNIFIED SCRAPE WINDOW (leagues AND friendlies, both anchored on today)
+# SCRAPE WINDOW (anchored on today)
 # ============================================================
-# Single shared window size, in days, used by BOTH
-# scrape_all_leagues_window() and scrape_all_friendlies_window() in
-# leagues_scraper.py -- both now anchor strictly on "today"
+# Window size, in days, used by scrape_all_leagues_window() in
+# leagues_scraper.py -- anchors strictly on "today"
 # (datetime.now(UTC).date()), no reference-date creep/high-water-mark
-# heuristics. Replaces the old split of REFERENCE_WINDOW_DAYS (13, for
-# leagues) vs FRIENDLIES_WINDOW_DAYS (10, for friendlies) with one
-# number applied identically to both, per explicit request: "13 days
-# for both friendlies and leagues, referenced from today, all of them."
+# heuristics.
 SCRAPE_WINDOW_DAYS = 13
 
 # ============================================================
@@ -108,7 +108,7 @@ LEAGUES = {
 # calendar day (see FixtureStore.advance_reference_date_if_needed).
 #
 # NO LONGER USED by scrape_all_leagues_window() -- leagues now anchor on
-# today directly, same as friendlies, per SCRAPE_WINDOW_DAYS above. Left
+# today directly, per SCRAPE_WINDOW_DAYS above. Left
 # in place only because mongo_store.FixtureStore.get_reference_date() /
 # advance_reference_date_if_needed() still reference these constants;
 # harmless dead weight now that nothing calls those methods from the
@@ -121,125 +121,9 @@ REFERENCE_WINDOW_DAYS = 13
 # Shield). Qualifying rounds are excluded regardless of league.
 PRIORITY_LEAGUE_ORDER = ["epl", "ucl", "europa", "facup", "community_shield"]
 
-# ============================================================
-# CLUB FRIENDLIES (EPL / Serie A clubs only) -- leagues_scraper.py
-# ============================================================
-# IMPORTANT: 365Scores does NOT have a separate competitionId per
-# parent league for friendlies -- there is no "EPL friendlies" or
-# "Serie A friendlies" id to fetch. Every club's friendly worldwide
-# (6000+ clubs) is pooled into ONE competition, "Club Friendlies",
-# verified live at:
-#   https://www.365scores.com/football/league/club-friendlies-321
-# If this ever starts returning 0 games, re-derive the id from that
-# URL's trailing number, same as the LEAGUES dict above.
-FRIENDLIES_COMPETITION_ID = 321
-
-# Because the id above is a single global "everyone's friendlies"
-# bucket, leagues_scraper.py fetches it whole and then narrows it down
-# to only fixtures where at least one side is a club in these name
-# lists (case-insensitive substring match against 365Scores'
-# homeCompetitor/awayCompetitor "name" field -- see
-# threesixtyfive.filter_games_by_club_names). Several aliases are
-# listed per club since 365Scores' display name doesn't always match
-# the club's full/common English name (e.g. "Man City" vs "Manchester
-# City", "Spurs" vs "Tottenham", "Inter" vs "Internazionale").
-#
-# Rosters below reflect the CONFIRMED 2026-27 line-ups as of the top
-# of this season (verified July 2026, not carried over from the
-# 2025-26 season):
-#   EPL: Coventry City, Ipswich Town, Hull City promoted, replacing
-#        Wolves, Burnley, West Ham (relegated).
-#   Serie A: Venezia, Frosinone, Monza promoted, replacing Cremonese,
-#        Hellas Verona, Pisa (relegated).
-# Re-check both lists every close season -- a stale list here silently
-# drops that club's friendlies (false negative) or, if a promoted/
-# relegated club shares a name fragment with an existing entry,
-# wrongly includes friendlies that belong to a different division
-# entirely (false positive).
-EPL_CLUB_NAMES = [
-    "Liverpool",
-    "Arsenal",
-    "Manchester City",
-    "Man City",
-    "Chelsea",
-    "Newcastle",
-    "Aston Villa",
-    "Nottingham Forest",
-    "Nott'm Forest",
-    "Brighton",
-    "Bournemouth",
-    "Fulham",
-    "Crystal Palace",
-    "Everton",
-    "Brentford",
-    "Manchester United",
-    "Man Utd",
-    "Man United",
-    "Tottenham",
-    "Spurs",
-    "Sunderland",
-    "Leeds",
-    "Coventry",
-    "Ipswich",
-    "Hull City",
-    "Hull",
-]
-
-SERIEA_CLUB_NAMES = [
-    "Atalanta",
-    "Bologna",
-    "Cagliari",
-    "Como",
-    "Fiorentina",
-    "Frosinone",
-    "Genoa",
-    "Inter",
-    "Internazionale",
-    "Juventus",
-    "Juve",
-    "Lazio",
-    "Lecce",
-    "AC Milan",
-    "Milan",
-    "Monza",
-    "Napoli",
-    "Parma",
-    "Roma",
-    "Sassuolo",
-    "Torino",
-    "Udinese",
-    "Venezia",
-]
-
-# Default friendlies window: 10 days starting 2026-07-26, per the
-# pre-season friendly slate requested when this was set up. Override
-# with --start-date/--days on leagues_scraper.py's CLI for any later
-# window once this one has passed. Only used by scrape_friendlies()
-# (the fixed-date-range variant) -- the rolling scrape_friendlies_window()
-# now defaults to SCRAPE_WINDOW_DAYS from today instead.
-FRIENDLIES_DEFAULT_START_DATE = "2026-07-25"
-FRIENDLIES_DEFAULT_RANGE_DAYS = 10
-
-# Rolling window size (in days) for scrape_friendlies_window() /
-# scrape_all_friendlies_window(). Superseded by SCRAPE_WINDOW_DAYS above
-# for the automatic path (poller.py's _trigger_rescrape and
-# leagues_scraper.py's default no-flags run both now pass
-# SCRAPE_WINDOW_DAYS explicitly) -- kept only as the fallback default on
-# scrape_friendlies_window()'s days_ahead parameter for direct/manual
-# calls that don't pass one.
-FRIENDLIES_WINDOW_DAYS = 10
-
-FRIENDLIES = {
-    "epl_friendlies": {
-        "competition_id": FRIENDLIES_COMPETITION_ID,
-        "name": "Premier League Club Friendlies",
-        "prefix": "epl_friendly",
-        "club_names": EPL_CLUB_NAMES,
-    },
-    "seriea_friendlies": {
-        "competition_id": FRIENDLIES_COMPETITION_ID,
-        "name": "Serie A Club Friendlies",
-        "prefix": "seriea_friendly",
-        "club_names": SERIEA_CLUB_NAMES,
-    },
-}
+# Club Friendlies configuration (competitionId, EPL/Serie A club-name
+# lists, date windows) has been removed from this repo entirely -- it
+# now lives in the standalone `friendly_funtassy` service, which keeps
+# its own full copy of this file and writes into the same shared
+# `games` collection via a different `source` tag ("friendly_hardcoded"
+# vs this repo's "365scores").

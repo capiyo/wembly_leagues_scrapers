@@ -17,10 +17,9 @@ manual/CLI use -- e.g. seeding a brand-new league for the first time --
 but the poller itself only ever calls the *_window variants.
 
 Usage:
-    # DEFAULT: plain run now does the ROLLING WINDOW for both leagues
-    # AND friendlies together -- NOT a full-season scrape. Leagues use
-    # config.REFERENCE_WINDOW_DAYS (13 days), friendlies use
-    # config.FRIENDLIES_WINDOW_DAYS (10 days, anchored on today):
+    # DEFAULT: plain run now does the ROLLING WINDOW scrape -- NOT a
+    # full-season scrape. Uses config.SCRAPE_WINDOW_DAYS (13 days),
+    # anchored on today:
     python leagues_scraper.py
     python leagues_scraper.py --league all
 
@@ -43,16 +42,11 @@ Usage:
     python leagues_scraper.py --league epl --window
     python leagues_scraper.py --league all --window --days-ahead 7
 
-    # Club Friendlies for EPL + Serie A clubs, FIXED date range instead
-    # of the rolling default (competitionId=321 is a single global
-    # bucket covering every club worldwide -- see
-    # config.FRIENDLIES_COMPETITION_ID -- so this fetches by date range
-    # and filters client-side to just the tracked clubs). Defaults to
-    # config.FRIENDLIES_DEFAULT_START_DATE for
-    # config.FRIENDLIES_DEFAULT_RANGE_DAYS days:
-    python leagues_scraper.py --friendlies
-    python leagues_scraper.py --friendlies --friendly-key epl_friendlies
-    python leagues_scraper.py --friendlies --start-date 2026-07-26 --days 10
+Club Friendlies scraping has been removed from this module -- that's now
+owned entirely by the standalone `friendly_funtassy` service (hardcoded
+fixture list + 365Scores "midnight surrender" resolver), which writes
+into the same shared `games` collection. This scraper only ever handles
+config.LEAGUES now.
 """
 
 from __future__ import annotations
@@ -406,10 +400,9 @@ def scrape_league_fixtures_window(
             reference.strftime("%Y-%m-%d"),
         )
     else:
-        # Anchor strictly on TODAY -- same convention as
-        # scrape_friendlies_window(), per explicit request: both leagues
-        # and friendlies now use one unified window (config.SCRAPE_WINDOW_DAYS,
-        # 13 days), referenced from today, every time this runs. This
+        # Anchor strictly on TODAY, per explicit request: every league
+        # uses one unified window (config.SCRAPE_WINDOW_DAYS, 13 days),
+        # referenced from today, every time this runs. This
         # replaces the previous heuristic that anchored on
         # store.get_latest_kickoff_for_league() (continue from wherever
         # the last scrape left off) or the competition's own earliest
@@ -494,322 +487,6 @@ def scrape_league_fixtures_window(
     return _upsert_games(store, in_window, league_key, forwarder=forwarder)
 
 
-# ============================================================
-# CLUB FRIENDLIES (EPL / Serie A clubs only)
-# ============================================================
-
-
-def scrape_friendlies(
-    store: FixtureStore,
-    friendly_key: str,
-    start_date: Optional[str] = None,
-    days: Optional[int] = None,
-    forwarder: Optional[Forwarder] = None,
-) -> int:
-    """Fetch Club Friendlies (competitionId=321, one global bucket --
-    see config.FRIENDLIES_COMPETITION_ID) for a date window, then keep
-    only fixtures involving an EPL or Serie A club (config.py's
-    EPL_CLUB_NAMES / SERIEA_CLUB_NAMES) before upserting.
-
-    start_date/days default to config.FRIENDLIES_DEFAULT_START_DATE /
-    config.FRIENDLIES_DEFAULT_RANGE_DAYS (2026-07-26, 10-day range) --
-    override via leagues_scraper.py's --start-date/--days CLI flags
-    once that window has passed and a later one is needed.
-    """
-    if friendly_key not in config.FRIENDLIES:
-        raise ValueError(
-            f"Unknown friendlies key: {friendly_key!r}. Known: {list(config.FRIENDLIES)}"
-        )
-
-    friendly_cfg = config.FRIENDLIES[friendly_key]
-    competition_id = friendly_cfg["competition_id"]
-    club_names = friendly_cfg["club_names"]
-
-    start_date = start_date or config.FRIENDLIES_DEFAULT_START_DATE
-    days = days if days is not None else config.FRIENDLIES_DEFAULT_RANGE_DAYS
-
-    start_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d")
-    end_dt = start_dt + datetime.timedelta(days=days)
-    end_date = end_dt.strftime("%Y-%m-%d")
-
-    logger.info(
-        "Fetching %s from 365Scores (competitionId=%s, %s..%s) ...",
-        friendly_cfg["name"],
-        competition_id,
-        start_date,
-        end_date,
-    )
-
-    games = threesixtyfive.fetch_games_by_date_range(
-        [competition_id], start_date=start_date, end_date=end_date
-    )
-
-    if games is None:
-        logger.error(
-            "fetch_games_by_date_range(%s) returned None -- network/API error",
-            competition_id,
-        )
-        return 0
-
-    logger.info(
-        "365Scores returned %d raw Club Friendlies games for %s..%s (all clubs, unfiltered)",
-        len(games),
-        start_date,
-        end_date,
-    )
-
-    club_games = threesixtyfive.filter_games_by_club_names(games, club_names)
-
-    logger.info(
-        "%s: %d/%d fixtures involve a tracked club",
-        friendly_cfg["name"],
-        len(club_games),
-        len(games),
-    )
-
-    if not club_games:
-        return 0
-
-    # _upsert_games looks up config.LEAGUES[league_key] for prefix/name --
-    # friendlies live in a separate config.FRIENDLIES dict, so build the
-    # same {prefix, name} shape it expects on the fly rather than
-    # duplicating _upsert_games' body here.
-    return _upsert_friendly_games(store, club_games, friendly_key, forwarder=forwarder)
-
-
-def _upsert_friendly_games(
-    store: FixtureStore,
-    games: list[dict],
-    friendly_key: str,
-    forwarder: Optional[Forwarder] = None,
-) -> int:
-    """Same shape as _upsert_games, but reads from config.FRIENDLIES
-    instead of config.LEAGUES (friendlies aren't a real 365Scores
-    competitionId per league, so they don't belong in that dict)."""
-    friendly_cfg = config.FRIENDLIES[friendly_key]
-    prefix = friendly_cfg["prefix"]
-    friendly_name = friendly_cfg["name"]
-
-    upserted = 0
-    for game in games:
-        game_id = str(game.get("id"))
-        home_team = (game.get("homeCompetitor") or {}).get("name", "Unknown")
-        away_team = (game.get("awayCompetitor") or {}).get("name", "Unknown")
-        home_competitor_id = (game.get("homeCompetitor") or {}).get("id")
-        away_competitor_id = (game.get("awayCompetitor") or {}).get("id")
-        # NOTE: competition_id stored here is 321 (Club Friendlies) for
-        # every row -- it's the real 365Scores id for this fixture, not
-        # a per-parent-league id, since no such id exists.
-        competition_id = game.get("competitionId")
-        comp_name = game.get("competitionDisplayName") or friendly_name
-        kickoff = _parse_kickoff(game.get("startTime"))
-        status = _status_to_internal(game.get("statusText", ""))
-        match_id = f"{prefix}_{game_id}"
-
-        is_new = store.upsert_fixture(
-            match_id=match_id,
-            threesixtyfive_game_id=game_id,
-            home_team=home_team,
-            away_team=away_team,
-            home_competitor_id=home_competitor_id,
-            away_competitor_id=away_competitor_id,
-            competition_id=competition_id,
-            kickoff_utc=kickoff,
-            status=status,
-            competition_name=comp_name,
-            odds=game.get("odds", {}),
-            league_key=friendly_key,
-            round_num=game.get("roundNum"),
-            round_name=game.get("roundName"),
-            group_num=game.get("groupNum"),
-            group_name=game.get("groupName"),
-        )
-        upserted += 1
-        logger.info(
-            "Upserted %s: %s vs %s [%s] kickoff=%s (%s)",
-            match_id,
-            home_team,
-            away_team,
-            status,
-            kickoff.strftime("%Y-%m-%d %H:%M"),
-            comp_name,
-        )
-
-        if is_new and forwarder is not None:
-            created_ok = forwarder.create_sub_fixture_markets(match_id)
-            if not created_ok:
-                logger.warning(
-                    f"⚠️ {match_id}: one or more sub-fixture markets failed to create "
-                    f"(see forwarder logs above) -- will NOT be retried automatically, "
-                    f"since is_new only fires once per fixture"
-                )
-
-    return upserted
-
-
-def scrape_all_friendlies(
-    store: FixtureStore,
-    start_date: Optional[str] = None,
-    days: Optional[int] = None,
-    forwarder: Optional[Forwarder] = None,
-) -> dict[str, int]:
-    """Scrape every entry in config.FRIENDLIES. Returns {friendly_key: count}."""
-    results: dict[str, int] = {}
-    for friendly_key in config.FRIENDLIES:
-        try:
-            results[friendly_key] = scrape_friendlies(
-                store,
-                friendly_key,
-                start_date=start_date,
-                days=days,
-                forwarder=forwarder,
-            )
-        except Exception as exc:
-            logger.error("Friendlies scrape failed for key=%s: %s", friendly_key, exc)
-            results[friendly_key] = 0
-    return results
-
-
-def scrape_friendlies_window(
-    store: FixtureStore,
-    friendly_key: str,
-    days_ahead: Optional[int] = None,
-    forwarder: Optional[Forwarder] = None,
-) -> int:
-    """Rolling-window counterpart to scrape_friendlies(): always anchors
-    on the REAL current date (datetime.now(UTC).date()) rather than a
-    fixed config.FRIENDLIES_DEFAULT_START_DATE, and spans
-    days_ahead (default config.SCRAPE_WINDOW_DAYS, 13) days from there.
-    This is what poller.py's _trigger_rescrape() calls automatically
-    after every match completes, and what leagues_scraper.py's default
-    (no-flags) run uses -- so "today" is always whatever day it actually
-    is when this runs, not a value that goes stale once the
-    originally-configured window passes.
-
-    REWRITTEN: this used to call threesixtyfive.fetch_games_by_date_range(),
-    which asks 365Scores for a startDate/endDate range on the
-    /web/games/fixtures/ endpoint. Confirmed against real logs: that
-    endpoint IGNORES startDate/endDate entirely for competitionId=321
-    (Club Friendlies) -- every day in a 14-day day-by-day loop returned
-    the exact same today-only result set, regardless of what date was
-    requested. No amount of date-param tuning fixes that; there's no
-    working date filter to loop over.
-
-    Instead this now uses the exact same pattern
-    scrape_league_fixtures_window() already uses successfully for every
-    league: threesixtyfive.fetch_games_by_competition() (competitions
-    filter only, NO date params at all) reliably returns that
-    competition's near-term slate of fixtures in one call (confirmed:
-    EPL alone returns 70 games spanning weeks ahead, not just today) --
-    then the date window is applied CLIENT-SIDE in Python against each
-    game's actual kickoff time, same as the league path already does.
-    Club Friendlies (competitionId=321) pools 6000+ clubs worldwide, so
-    this single unbounded fetch can be a much larger payload than a
-    single league's -- that's an acceptable, known tradeoff for
-    correctness over the alternative (a date filter that doesn't work
-    at all).
-    """
-    if friendly_key not in config.FRIENDLIES:
-        raise ValueError(
-            f"Unknown friendlies key: {friendly_key!r}. Known: {list(config.FRIENDLIES)}"
-        )
-
-    friendly_cfg = config.FRIENDLIES[friendly_key]
-    competition_id = friendly_cfg["competition_id"]
-    club_names = friendly_cfg["club_names"]
-
-    days_ahead = config.SCRAPE_WINDOW_DAYS if days_ahead is None else days_ahead
-
-    logger.info(
-        "Fetching %s from 365Scores (competitionId=%s, unbounded fetch -- date "
-        "window of %d days from today applied client-side below) ...",
-        friendly_cfg["name"],
-        competition_id,
-        days_ahead,
-    )
-
-    games = threesixtyfive.fetch_games_by_competition([competition_id])
-
-    if games is None:
-        logger.error(
-            "fetch_games_by_competition(%s) returned None -- network/API error",
-            competition_id,
-        )
-        return 0
-
-    logger.info(
-        "365Scores returned %d raw Club Friendlies games (all clubs worldwide, unfiltered)",
-        len(games),
-    )
-
-    now = datetime.datetime.now(datetime.timezone.utc)
-    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    cutoff = today + datetime.timedelta(days=days_ahead)
-
-    in_window = []
-    for g in games:
-        kickoff = _parse_kickoff(g.get("startTime"))
-        is_live_now = _status_to_internal(g.get("statusText", "")) == "live"
-        # Same lower-bound convention as scrape_league_fixtures_window():
-        # compare calendar dates, not exact datetimes, and let an
-        # already-live match through even if its kickoff date is
-        # technically "yesterday" in UTC.
-        if kickoff.date() < today.date() and not is_live_now:
-            continue
-        if kickoff > cutoff:
-            continue
-        in_window.append(g)
-
-    logger.info(
-        "%s: %d/%d fixtures fall within the %d-day window from %s (all clubs, unfiltered)",
-        friendly_cfg["name"],
-        len(in_window),
-        len(games),
-        days_ahead,
-        today.strftime("%Y-%m-%d"),
-    )
-
-    club_games = threesixtyfive.filter_games_by_club_names(in_window, club_names)
-
-    logger.info(
-        "%s: %d/%d in-window fixtures involve a tracked club",
-        friendly_cfg["name"],
-        len(club_games),
-        len(in_window),
-    )
-
-    if not club_games:
-        return 0
-
-    return _upsert_friendly_games(store, club_games, friendly_key, forwarder=forwarder)
-
-
-def scrape_all_friendlies_window(
-    store: FixtureStore,
-    days_ahead: Optional[int] = None,
-    forwarder: Optional[Forwarder] = None,
-) -> dict[str, int]:
-    """Rolling-window counterpart to scrape_all_friendlies(): runs
-    scrape_friendlies_window() (today-anchored, config.FRIENDLIES_WINDOW_DAYS
-    by default) for every entry in config.FRIENDLIES. This is what
-    poller.py's _trigger_rescrape() calls alongside
-    scrape_all_leagues_window() on every reactive rescrape and the
-    twice-daily backstop, and what leagues_scraper.py's default
-    (no-flags) run calls for its friendlies half."""
-    results: dict[str, int] = {}
-    for friendly_key in config.FRIENDLIES:
-        try:
-            results[friendly_key] = scrape_friendlies_window(
-                store, friendly_key, days_ahead=days_ahead, forwarder=forwarder
-            )
-        except Exception as exc:
-            logger.error(
-                "Windowed friendlies scrape failed for key=%s: %s", friendly_key, exc
-            )
-            results[friendly_key] = 0
-    return results
-
-
 def scrape_all_leagues_window(
     store: FixtureStore,
     days_ahead: int = config.SCRAPE_WINDOW_DAYS,
@@ -862,38 +539,6 @@ def main() -> None:
         help="Which league to scrape (default: all).",
     )
     parser.add_argument(
-        "--friendlies",
-        action="store_true",
-        help=(
-            "Scrape Club Friendlies (competitionId=321) instead of --league, "
-            "filtered down to EPL/Serie A clubs (config.FRIENDLIES). Combine "
-            "with --friendly-key to scrape just one of the two."
-        ),
-    )
-    parser.add_argument(
-        "--friendly-key",
-        default="all",
-        choices=["all"] + list(config.FRIENDLIES.keys()),
-        help="Which friendlies bucket to scrape with --friendlies (default: all).",
-    )
-    parser.add_argument(
-        "--start-date",
-        default=None,
-        help=(
-            "Start date (YYYY-MM-DD) for --friendlies, default: "
-            f"config.FRIENDLIES_DEFAULT_START_DATE ({config.FRIENDLIES_DEFAULT_START_DATE})."
-        ),
-    )
-    parser.add_argument(
-        "--days",
-        type=int,
-        default=None,
-        help=(
-            "Number of days from --start-date for --friendlies, default: "
-            f"config.FRIENDLIES_DEFAULT_RANGE_DAYS ({config.FRIENDLIES_DEFAULT_RANGE_DAYS})."
-        ),
-    )
-    parser.add_argument(
         "--round-only",
         action="store_true",
         help="Only fetch a single round instead of the full fixture list. Only valid with a single --league (not 'all').",
@@ -923,9 +568,8 @@ def main() -> None:
             "fixture for --league all (or the single --league given), with no "
             "date window at all. Only needed for manual/one-off seeding (e.g. "
             "a brand-new league). The plain no-flags run no longer does this "
-            "automatically -- it now runs the rolling windowed scrape (leagues "
-            "at config.REFERENCE_WINDOW_DAYS days + friendlies at "
-            "config.FRIENDLIES_WINDOW_DAYS days) instead, same as the poller."
+            "automatically -- it now runs the rolling windowed scrape "
+            "(config.SCRAPE_WINDOW_DAYS days) instead, same as the poller."
         ),
     )
     args = parser.parse_args()
@@ -938,35 +582,7 @@ def main() -> None:
     store = FixtureStore(mongo_uri)
     forwarder = create_forwarder()
     try:
-        if args.friendlies:
-            if args.friendly_key == "all":
-                results = scrape_all_friendlies(
-                    store,
-                    start_date=args.start_date,
-                    days=args.days,
-                    forwarder=forwarder,
-                )
-                total = sum(results.values())
-                logger.info(
-                    "Friendlies scrape complete: %s (total=%d) into '%s' collection.",
-                    results,
-                    total,
-                    config.MONGO_COLLECTION,
-                )
-            else:
-                count = scrape_friendlies(
-                    store,
-                    args.friendly_key,
-                    start_date=args.start_date,
-                    days=args.days,
-                    forwarder=forwarder,
-                )
-                logger.info(
-                    "Friendlies scrape complete: %d games upserted into '%s' collection.",
-                    count,
-                    config.MONGO_COLLECTION,
-                )
-        elif args.round_only:
+        if args.round_only:
             if args.league == "all":
                 logger.error(
                     "--round-only requires a specific --league (e.g. --league epl), not 'all'."
@@ -1015,22 +631,13 @@ def main() -> None:
                 league_results = scrape_all_leagues_window(
                     store, days_ahead=config.SCRAPE_WINDOW_DAYS, forwarder=forwarder
                 )
-                friendlies_results = scrape_all_friendlies_window(
-                    store, days_ahead=config.SCRAPE_WINDOW_DAYS, forwarder=forwarder
-                )
                 league_total = sum(league_results.values())
-                friendlies_total = sum(friendlies_results.values())
                 logger.info(
                     "Default windowed scrape complete: leagues=%s (total=%d, "
-                    "%d-day window) + friendlies=%s (total=%d, %d-day window from "
-                    "today) = grand total %d upserted into '%s' collection.",
+                    "%d-day window) upserted into '%s' collection.",
                     league_results,
                     league_total,
                     config.SCRAPE_WINDOW_DAYS,
-                    friendlies_results,
-                    friendlies_total,
-                    config.SCRAPE_WINDOW_DAYS,
-                    league_total + friendlies_total,
                     config.MONGO_COLLECTION,
                 )
         else:

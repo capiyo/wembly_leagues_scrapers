@@ -1,14 +1,18 @@
 """
-365Scores API client for league, friendly, and World Cup/international data.
+365Scores API client for league and World Cup/international data.
 Fetches: fixtures, live scores, events, lineups, statistics, and commentary.
 
 NOTE: This is the league-scraper's copy of the module and had drifted from
 the World Cup poller's copy -- it was missing the shared _fetch_play_by_play_raw
 helper and, worse, fetch_commentary() hardcoded "team": None instead of
 resolving CompetitorNum the way fetch_match_events() already did. Both are
-fixed below by mirroring the World Cup version's structure exactly. The
-league-only additions (fetch_games_by_date_range, filter_games_by_club_names)
-are kept as-is since the World Cup version doesn't need them.
+fixed below by mirroring the World Cup version's structure exactly.
+
+Club Friendlies support (date-range fetching + client-side club-name
+filtering) has been removed from this file -- friendlies are now handled
+entirely by the standalone `friendly_funtassy` service, which keeps its
+own full copy of this module. Nothing in this repo calls friendlies logic
+anymore.
 """
 
 from __future__ import annotations
@@ -16,7 +20,6 @@ from __future__ import annotations
 import logging
 import re
 import requests
-from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger("worldcup_poller.sources.threesixtyfive")
@@ -135,204 +138,6 @@ def fetch_games_by_competition(
     except ValueError as e:
         logger.error(f"Failed to parse JSON response: {e}")
         return None
-
-
-def _fetch_games_for_single_date(
-    competition_ids: List[int],
-    date_str: str,
-    timezone_name: str = "Africa/Nairobi",
-    user_country_id: int = 413,
-    show_odds: bool = True,
-) -> Optional[List[Dict[str, Any]]]:
-    """One day's worth of games for the given competitions. Internal
-    helper for fetch_games_by_date_range() -- see that function's
-    docstring for why this loops per-day instead of trusting a
-    startDate/endDate range in a single request.
-
-    REVERTED: a prior version of this dropped the `competitions` filter
-    to test whether 365Scores was ignoring startDate/endDate specifically
-    when combined with it -- that turned every one of the 13 daily
-    requests in a friendlies scrape into a fetch of EVERY football
-    fixture worldwide for that day instead of just Club Friendlies, a
-    much heavier/slower request run synchronously in the poll loop 13
-    times per scrape. That caused scraping to stall/time out entirely
-    (confirmed: manual deploy produced zero games). Reverted back to
-    sending `competitions` -- narrow, fast requests, same as before that
-    experiment. The date-match diagnostic below is kept since it's cheap
-    and still useful, but the untested "drop the filter" theory is not
-    worth another live outage to re-confirm; if the date-range quirk
-    needs revisiting, do it against a single manual/off-path call, not
-    inside the automatic scrape loop.
-    """
-    params = {
-        "appTypeId": 5,
-        "langId": 1,
-        "timezoneName": timezone_name,
-        "userCountryId": user_country_id,
-        "competitions": ",".join(str(cid) for cid in competition_ids),
-        "startDate": date_str,
-        "endDate": date_str,
-        "showOdds": str(show_odds).lower(),
-        "includeTopBettingOpportunity": "1",
-        "topBookmaker": "14",
-    }
-
-    url = f"{BASE_URL}/web/games/fixtures/"
-
-    try:
-        logger.debug(f"Fetching from {url} with params {params}")
-        response = requests.get(url, headers=DEFAULT_HEADERS, params=params, timeout=30)
-        response.raise_for_status()
-
-        data = response.json()
-        games = data.get("games", [])
-
-        # DIAGNOSTIC: how many of the returned games actually kick off on
-        # date_str, vs some other date? Cheap to keep -- doesn't change
-        # what's requested, just reports on what came back.
-        on_requested_date = sum(
-            1 for g in games if (g.get("startTime") or "").startswith(date_str)
-        )
-        logger.info(
-            f"_fetch_games_for_single_date({competition_ids}, requested={date_str}): "
-            f"{len(games)} games returned, {on_requested_date}/{len(games)} actually "
-            f"dated {date_str}"
-            + (
-                " -- MISMATCH: 365Scores may be ignoring the date param"
-                if games and on_requested_date == 0
-                else ""
-            )
-        )
-        return games
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch games from 365Scores for {date_str}: {e}")
-        return None
-    except ValueError as e:
-        logger.error(f"Failed to parse JSON response for {date_str}: {e}")
-        return None
-
-
-def fetch_games_by_date_range(
-    competition_ids: List[int],
-    start_date: str,
-    end_date: str,
-    timezone_name: str = "Africa/Nairobi",
-    user_country_id: int = 413,
-    show_odds: bool = True,
-) -> Optional[List[Dict[str, Any]]]:
-    """
-    Games across a date window, for Club Friendlies (competitionId=321):
-    that single competition pools every friendly for 6000+ clubs
-    worldwide, so fetching it without a date bound would return a huge,
-    mostly-irrelevant payload.
-
-    IMPLEMENTATION NOTE: this used to make ONE request to
-    /web/games/fixtures/ with startDate/endDate set to the full window
-    and rely on 365Scores honoring that range. In practice, when a
-    `competitions` filter is present alongside startDate/endDate, the
-    endpoint appears to silently ignore the range and just return
-    "today" -- observed as friendlies scrapes configured for a 7-10 day
-    window only ever returning that day's fixtures. To sidestep that
-    quirk entirely rather than depend on whichever way 365Scores
-    happens to be behaving, this now issues one request PER DAY in
-    [start_date, end_date] (inclusive) via _fetch_games_for_single_date()
-    and merges the results, deduping by game id -- a fixture appearing
-    in more than one day's response (shouldn't normally happen, but
-    cheap to guard against) is only kept once.
-
-    start_date/end_date are both "YYYY-MM-DD". Costs len(date range)
-    requests instead of 1 -- for the typical 7-10 day friendlies window
-    that's 7-10 calls, which is a non-issue at the polling intervals
-    this is used at.
-    """
-    try:
-        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-    except ValueError as e:
-        logger.error(
-            f"fetch_games_by_date_range: bad date format ({start_date}..{end_date}): {e}"
-        )
-        return None
-
-    if end_dt < start_dt:
-        logger.error(
-            f"fetch_games_by_date_range: end_date {end_date} is before start_date {start_date}"
-        )
-        return None
-
-    seen_ids = set()
-    merged: List[Dict[str, Any]] = []
-    any_success = False
-
-    day = start_dt
-    while day <= end_dt:
-        date_str = day.strftime("%Y-%m-%d")
-        day_games = _fetch_games_for_single_date(
-            competition_ids,
-            date_str,
-            timezone_name=timezone_name,
-            user_country_id=user_country_id,
-            show_odds=show_odds,
-        )
-        if day_games is not None:
-            any_success = True
-            for game in day_games:
-                gid = game.get("id")
-                if gid is not None and gid in seen_ids:
-                    continue
-                if gid is not None:
-                    seen_ids.add(gid)
-                merged.append(game)
-        day += timedelta(days=1)
-
-    if not any_success:
-        # Every single day's request failed (network/API error) -- return
-        # None so callers can distinguish "API down" from "API up, 0 games".
-        return None
-
-    logger.info(
-        f"fetch_games_by_date_range({competition_ids}, {start_date}..{end_date}): "
-        f"{len(merged)} games returned across {(end_dt - start_dt).days + 1} day(s)"
-    )
-    return merged
-
-
-def filter_games_by_club_names(
-    games: List[Dict[str, Any]],
-    club_names: List[str],
-) -> List[Dict[str, Any]]:
-    """
-    Keep only games where the home OR away competitor name contains
-    (case-insensitive) one of club_names. Needed because 365Scores has
-    no per-parent-league friendlies competitionId -- Club Friendlies
-    (id 321) pools every club worldwide, so narrowing down to "just
-    EPL clubs' friendlies" or "just Serie A clubs' friendlies" has to
-    happen client-side against team names, not via a competitionId.
-
-    Substring match (not exact-equals) because 365Scores' name field
-    sometimes carries extra qualifiers 365Scores itself adds for
-    disambiguation (e.g. suffixed age-group/reserve-team markers on
-    otherwise-identical club names) -- config.py's *_CLUB_NAMES lists
-    already carry the common aliases (e.g. "Man City", "Spurs") to
-    catch 365Scores' own display-name variants.
-    """
-    needles = [n.lower() for n in club_names]
-
-    def _matches(name: Optional[str]) -> bool:
-        if not name:
-            return False
-        name_lower = name.lower()
-        return any(needle in name_lower for needle in needles)
-
-    filtered = []
-    for game in games:
-        home_name = (game.get("homeCompetitor") or {}).get("name")
-        away_name = (game.get("awayCompetitor") or {}).get("name")
-        if _matches(home_name) or _matches(away_name):
-            filtered.append(game)
-
-    return filtered
 
 
 def fetch_game_details(

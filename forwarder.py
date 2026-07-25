@@ -571,7 +571,7 @@ class Forwarder:
 
         Args:
             fixture_id: The match id (e.g. "epl_4627864" or
-                "epl_friendly_4627864").
+                "seriea_4627864").
             result: "home", "away", or "draw".
         """
         if result not in ("home", "away", "draw"):

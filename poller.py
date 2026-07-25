@@ -510,7 +510,7 @@ class Poller:
             # THE BUG: this used to call mark_lineups_done() unconditionally
             # right after the attempt, regardless of whether lineups were
             # actually available yet. 365Scores frequently hasn't published
-            # a friendly's lineups by the time the first "soon"/"live" poll
+            # a match's lineups by the time the first "soon"/"live" poll
             # hits it -- that single miss permanently added match_id to
             # self.state_machine.lineups_fetched (an in-memory set, checked
             # by should_fetch_lineups() above), so every later cycle skipped
@@ -931,28 +931,24 @@ class Poller:
         self.forwarder.forward_live_update(live_update)
 
     def _trigger_rescrape(self, reason: str = ""):
-        """Re-run league AND friendlies fixture discovery so a
-        freshly-archived slot in `games` gets refilled right away,
-        instead of waiting for the next scheduled backstop.
+        """Re-run league fixture discovery so a freshly-archived slot in
+        `games` gets refilled right away, instead of waiting for the next
+        scheduled backstop.
 
-        Rolling window, both halves, now sharing ONE unified window size
-        (config.SCRAPE_WINDOW_DAYS, 13 by default) referenced from today
-        for both -- previously leagues used a separate reference-date
-        high-water-mark heuristic (config.REFERENCE_WINDOW_DAYS) and
-        friendlies used a plain today+N window at a different size
-        (config.FRIENDLIES_WINDOW_DAYS); both now behave identically:
-          - leagues_scraper.scrape_all_leagues_window() -- upserts league
-            fixtures kicking off within config.SCRAPE_WINDOW_DAYS days of
-            today, for every league in config.LEAGUES (including
-            comp3645, which previously had no scrape path at all -- see
-            config.py's comment on that entry).
-          - leagues_scraper.scrape_all_friendlies_window() -- upserts
-            Club Friendlies (competitionId=321, filtered to EPL/Serie A
-            clubs) kicking off within the same config.SCRAPE_WINDOW_DAYS
-            days of today.
+        leagues_scraper.scrape_all_leagues_window() upserts league
+        fixtures kicking off within config.SCRAPE_WINDOW_DAYS days of
+        today, for every league in config.LEAGUES (including comp3645,
+        which previously had no scrape path at all -- see config.py's
+        comment on that entry), anchored strictly on "today"
+        (datetime.now(UTC).date()), no reference-date creep/high-water-mark
+        heuristics.
 
         World Cup scraping (scraper.scrape_world_cup_fixtures) has been
-        removed from this path entirely.
+        removed from this path entirely. Club Friendlies discovery/
+        resolution is no longer triggered from here either -- it's now
+        handled independently by the standalone `friendly_funtassy`
+        service (its own resolver loop, on its own schedule), which
+        writes into this same shared `games` collection.
 
         Runs synchronously in the poll loop -- a slow 365Scores response
         here will delay polling of other live matches for that cycle. If
@@ -972,21 +968,6 @@ class Poller:
             )
         except Exception as e:
             logger.error(f"❌ League rescrape failed: {e}")
-
-        try:
-            logger.info(f"🔄 Triggering friendlies rescrape ({reason})...")
-            friendlies_results = leagues_scraper.scrape_all_friendlies_window(
-                self.store,
-                days_ahead=config.SCRAPE_WINDOW_DAYS,
-                forwarder=self.forwarder,
-            )
-            friendlies_total = sum(friendlies_results.values())
-            logger.info(
-                f"✅ Friendlies rescrape complete: {friendlies_results} "
-                f"(total={friendlies_total} fixtures upserted)"
-            )
-        except Exception as e:
-            logger.error(f"❌ Friendlies rescrape failed: {e}")
 
     def _finalize_match_result(self, match: Dict[str, Any]):
         match_id = match.get("matchId")
