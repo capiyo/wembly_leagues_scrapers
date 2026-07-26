@@ -63,6 +63,102 @@ MARKET_ID_FIRST_CORNER = "first_corner"
 MARKET_ID_OVER_UNDER_2_5 = "over_under_2_5"
 
 
+def _extract_position_label(position: Any) -> str:
+    """365Scores' `position` field is a nested object
+    ({"id":..,"name":..,"shortName":..}) in the real API response --
+    not a flat string. Prefer shortName, fall back to name, then to
+    str() for any unexpected shape (defensive, not expected to fire)."""
+    if isinstance(position, dict):
+        return position.get("shortName") or position.get("name") or ""
+    return str(position) if position is not None else ""
+
+
+def _map_lineup_member(member: Dict[str, Any]) -> Dict[str, Any]:
+    """Map one raw 365Scores lineup member (already enriched with
+    name/shortName/athleteId by fetch_lineups()'s roster join) into
+    the exact shape Rust's PlayerPayload requires.
+
+    KNOWN GAP (confirmed against a real saved payload, not guessed):
+    365Scores' lineup members carry NO jersey-number field and NO
+    captain flag anywhere in the response -- only status/statusText,
+    position, formation, yardFormation, ranking, and various ids.
+    jerseyNumber/captain are therefore defaulted below since there is
+    currently no source data for them. If 365Scores exposes these
+    elsewhere (a separate roster/squad endpoint keyed by athleteId,
+    for instance), wire that in here -- don't assume 0/false is
+    correct forever, it's a placeholder for missing data, not a
+    verified default.
+
+    Plain module-level function rather than a class staticmethod --
+    this used to be MatchStateMachine._map_lineup_member(), called as
+    MatchStateMachine._map_lineup_member(m). If the deployed process
+    was ever running a build of this file from before that method
+    existed, that class-attribute lookup fails with an AttributeError
+    even though the source on disk/in git is correct. A plain function
+    import can't go stale that way -- either the whole module is loaded
+    or the import itself fails loudly at startup instead of hiding
+    behind a class attribute lookup deep in a poll loop.
+    """
+    return {
+        "name": member.get("name") or member.get("shortName") or "Unknown",
+        "position": _extract_position_label(member.get("position")),
+        "jerseyNumber": member.get("jerseyNumber", 0),  # TODO: not in source data
+        "captain": member.get("captain", False),  # TODO: not in source data
+        "lineup": "starting" if member.get("statusText") == "Starting" else "bench",
+        "playerId": (
+            str(member.get("athleteId"))
+            if member.get("athleteId") is not None
+            else str(member.get("id")) if member.get("id") is not None else None
+        ),
+    }
+
+
+def _team_lineup_for_forwarder(team_lineup: Dict[str, Any]) -> Dict[str, Any]:
+    """Shape one side's raw 365Scores lineup into Rust's
+    TeamLineupPayload: {formation, coach: {name}, players, bench}.
+
+    365Scores doesn't give a dedicated "coach" field -- the coach is
+    just another entry in the same flat `members` array with
+    statusText == "Management". Everything else in `members` is a
+    player, split into players (Starting) vs bench (Substitute/
+    anything else)."""
+    if not team_lineup:
+        return {
+            "formation": "",
+            "coach": {"name": "Unknown"},
+            "players": [],
+            "bench": [],
+        }
+
+    members = team_lineup.get("members", [])
+    coach_entry = next(
+        (m for m in members if m.get("statusText") == "Management"), None
+    )
+    coach_name = (
+        coach_entry.get("name") or coach_entry.get("shortName") or "Unknown"
+        if coach_entry
+        else "Unknown"
+    )
+
+    players = []
+    bench = []
+    for m in members:
+        if m.get("statusText") == "Management":
+            continue
+        mapped = _map_lineup_member(m)
+        if mapped["lineup"] == "starting":
+            players.append(mapped)
+        else:
+            bench.append(mapped)
+
+    return {
+        "formation": team_lineup.get("formation") or "",
+        "coach": {"name": coach_name},
+        "players": players,
+        "bench": bench,
+    }
+
+
 class MatchStateMachine:
     def __init__(self, store: FixtureStore, forwarder: Forwarder):
         self.store = store
@@ -594,92 +690,6 @@ class Poller:
                 f"{len(new_entries)} entries -- will retry next cycle"
             )
 
-    @staticmethod
-    def _extract_position_label(position: Any) -> str:
-        """365Scores' `position` field is a nested object
-        ({"id":..,"name":..,"shortName":..}) in the real API response --
-        not a flat string. Prefer shortName, fall back to name, then to
-        str() for any unexpected shape (defensive, not expected to fire)."""
-        if isinstance(position, dict):
-            return position.get("shortName") or position.get("name") or ""
-        return str(position) if position is not None else ""
-
-    @staticmethod
-    def _map_lineup_member(member: Dict[str, Any]) -> Dict[str, Any]:
-        """Map one raw 365Scores lineup member (already enriched with
-        name/shortName/athleteId by fetch_lineups()'s roster join) into
-        the exact shape Rust's PlayerPayload requires.
-
-        KNOWN GAP (confirmed against a real saved payload, not guessed):
-        365Scores' lineup members carry NO jersey-number field and NO
-        captain flag anywhere in the response -- only status/statusText,
-        position, formation, yardFormation, ranking, and various ids.
-        jerseyNumber/captain are therefore defaulted below since there is
-        currently no source data for them. If 365Scores exposes these
-        elsewhere (a separate roster/squad endpoint keyed by athleteId,
-        for instance), wire that in here -- don't assume 0/false is
-        correct forever, it's a placeholder for missing data, not a
-        verified default.
-        """
-        return {
-            "name": member.get("name") or member.get("shortName") or "Unknown",
-            "position": MatchStateMachine._extract_position_label(member.get("position")),
-            "jerseyNumber": member.get("jerseyNumber", 0),  # TODO: not in source data
-            "captain": member.get("captain", False),  # TODO: not in source data
-            "lineup": "starting" if member.get("statusText") == "Starting" else "bench",
-            "playerId": (
-                str(member.get("athleteId"))
-                if member.get("athleteId") is not None
-                else str(member.get("id")) if member.get("id") is not None else None
-            ),
-        }
-
-    @staticmethod
-    def _team_lineup_for_forwarder(team_lineup: Dict[str, Any]) -> Dict[str, Any]:
-        """Shape one side's raw 365Scores lineup into Rust's
-        TeamLineupPayload: {formation, coach: {name}, players, bench}.
-
-        365Scores doesn't give a dedicated "coach" field -- the coach is
-        just another entry in the same flat `members` array with
-        statusText == "Management". Everything else in `members` is a
-        player, split into players (Starting) vs bench (Substitute/
-        anything else)."""
-        if not team_lineup:
-            return {
-                "formation": "",
-                "coach": {"name": "Unknown"},
-                "players": [],
-                "bench": [],
-            }
-
-        members = team_lineup.get("members", [])
-        coach_entry = next(
-            (m for m in members if m.get("statusText") == "Management"), None
-        )
-        coach_name = (
-            coach_entry.get("name") or coach_entry.get("shortName") or "Unknown"
-            if coach_entry
-            else "Unknown"
-        )
-
-        players = []
-        bench = []
-        for m in members:
-            if m.get("statusText") == "Management":
-                continue
-            mapped = MatchStateMachine._map_lineup_member(m)
-            if mapped["lineup"] == "starting":
-                players.append(mapped)
-            else:
-                bench.append(mapped)
-
-        return {
-            "formation": team_lineup.get("formation") or "",
-            "coach": {"name": coach_name},
-            "players": players,
-            "bench": bench,
-        }
-
     def _fetch_and_forward_lineups(self, match: Dict[str, Any]) -> bool:
         """Fetch + forward lineups for one match. Returns True only when
         lineups were actually available AND successfully forwarded --
@@ -715,8 +725,8 @@ class Poller:
 
             if lineups:
                 lineups_shaped = {
-                    "home": self._team_lineup_for_forwarder(lineups.get("home", {})),
-                    "away": self._team_lineup_for_forwarder(lineups.get("away", {})),
+                    "home": _team_lineup_for_forwarder(lineups.get("home", {})),
+                    "away": _team_lineup_for_forwarder(lineups.get("away", {})),
                 }
 
                 lineups_payload = {
