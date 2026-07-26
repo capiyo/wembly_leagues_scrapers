@@ -677,12 +677,11 @@ class Forwarder:
             method at full-time, blocking settle_bets/move_to_history
             from ever running for it.
 
-        ASSUMPTION (unconfirmed, same caveat as create_sub_fixture_market's
-        endpoint): mirrors that method's
-        "/sub_fixtures/sub-fixture/market/create" path with "/settle"
-        swapped in. Confirm this matches the actual Rust route and adjust
-        if not -- if it 404s, this will fail loudly via _post's logging
-        (payload + response body), not silently.
+        CONFIRMED against sub_fixture_routes() in the Rust router: the
+        settle route is "/sub-fixture/settle" -- flat, no "/market"
+        segment -- unlike create's "/sub-fixture/market/create". The
+        earlier guess that it mirrored create's path 404'd because of
+        that extra "/market" segment; this is the corrected path.
 
         Args:
             match_id: The match id.
@@ -697,7 +696,7 @@ class Forwarder:
             "market_id": market_id,
             "result": result,
         }
-        return self._post("/sub_fixtures/sub-fixture/market/settle", payload)
+        return self._post("/sub_fixtures/sub-fixture/settle", payload)
 
     # ============================================================
     # NOTIFICATIONS
