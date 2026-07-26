@@ -403,11 +403,18 @@ class Forwarder:
         """
         Forward lineups to the Rust API.
 
+        IMPORTANT: keys MUST be camelCase to match Rust's LineupsUpdate
+        struct (#[serde(rename = "fixtureId")] etc, all fields required,
+        no Option/default) -- a snake_case payload here fails serde
+        deserialization and the Rust API returns 422 Unprocessable Entity
+        with no useful detail on which field was the problem. Confirmed
+        by decoding the actual 422 response body during a live run.
+
         Expected payload:
         {
-            "fixture_id": "wc26_123",
-            "home_team": "Team A",
-            "away_team": "Team B",
+            "fixtureId": "wc26_123",
+            "homeTeam": "Team A",
+            "awayTeam": "Team B",
             "lineups": {
                 "home": {
                     "formation": "4-3-3",
@@ -416,10 +423,10 @@ class Forwarder:
                         {
                             "name": "Player",
                             "position": "GK",
-                            "jersey_number": 1,
+                            "jerseyNumber": 1,
                             "captain": false,
-                            "lineup": "starting|bench",
-                            "player_id": "123"
+                            "lineup": "starting",
+                            "playerId": "123"
                         }
                     ],
                     "bench": [...]
