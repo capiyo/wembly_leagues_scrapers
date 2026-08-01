@@ -245,6 +245,7 @@ def fetch_lineups(
                 player["name"] = info.get("name")
                 player["shortName"] = info.get("shortName")
                 player["athleteId"] = info.get("athleteId")
+                player["jerseyNumber"] = info.get("jerseyNumber")
         return lineup
 
     home_lineups = _attach_names(home_lineups)
