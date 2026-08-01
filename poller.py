@@ -597,12 +597,62 @@ class Poller:
             )
 
     @staticmethod
-    def _team_lineup_for_forwarder(team_lineup: Dict[str, Any]) -> Dict[str, Any]:
-        if not team_lineup:
-            return {}
+    def _map_lineup_player(member: Dict[str, Any]) -> Dict[str, Any]:
+        """Map a raw 365Scores lineup member onto Rust's PlayerPayload shape
+        (name, position, jerseyNumber, captain, lineup, playerId -- all
+        required, camelCase). 365Scores doesn't expose a captain flag at
+        all, so that always defaults to False here rather than guessing."""
+        position = member.get("position")
+        if isinstance(position, dict):
+            position_name = position.get("shortName") or position.get("name") or ""
+        else:
+            position_name = position or ""
+
+        lineup_slot = "starting" if member.get("statusText") == "Starting" else "bench"
+
+        player_id = member.get("athleteId") or member.get("id")
+
         return {
-            "formation": team_lineup.get("formation"),
-            "players": team_lineup.get("members", []),
+            "name": member.get("name") or member.get("shortName") or "Unknown",
+            "position": position_name,
+            "jerseyNumber": member.get("jerseyNumber") or 0,
+            "captain": False,
+            "lineup": lineup_slot,
+            "playerId": str(player_id) if player_id is not None else None,
+        }
+
+    def _team_lineup_for_forwarder(self, team_lineup: Dict[str, Any]) -> Dict[str, Any]:
+        """Reshape a 365Scores team lineup into Rust's TeamLineupPayload
+        shape. formation/coach/players/bench are all required fields on
+        the Rust side with no defaults, so every key must always be
+        present even when 365Scores gives us little to work with."""
+        members = team_lineup.get("members", []) if team_lineup else []
+
+        coach_member = next(
+            (m for m in members if m.get("statusText") == "Management"), None
+        )
+        coach_name = "Unknown"
+        if coach_member:
+            coach_name = (
+                coach_member.get("name") or coach_member.get("shortName") or "Unknown"
+            )
+
+        starting = [
+            self._map_lineup_player(m)
+            for m in members
+            if m.get("statusText") == "Starting"
+        ]
+        bench = [
+            self._map_lineup_player(m)
+            for m in members
+            if m.get("statusText") == "Substitute"
+        ]
+
+        return {
+            "formation": (team_lineup or {}).get("formation") or "",
+            "coach": {"name": coach_name},
+            "players": starting,
+            "bench": bench,
         }
 
     def _fetch_and_forward_lineups(self, match: Dict[str, Any]) -> bool:
@@ -645,9 +695,9 @@ class Poller:
                 }
 
                 lineups_payload = {
-                    "fixture_id": match_id,
-                    "home_team": home_team,
-                    "away_team": away_team,
+                    "fixtureId": match_id,
+                    "homeTeam": home_team,
+                    "awayTeam": away_team,
                     "lineups": lineups_shaped,
                 }
 
