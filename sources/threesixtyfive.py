@@ -12,7 +12,32 @@ Club Friendlies support (date-range fetching + client-side club-name
 filtering) has been removed from this file -- friendlies are now handled
 entirely by the standalone `friendly_funtassy` service, which keeps its
 own full copy of this module. Nothing in this repo calls friendlies logic
-anymore.
+anymore. NOTE: friendly_funtassy's copy of fetch_lineups likely has the
+same "empty placeholder" bug fixed below -- apply the same fix there too.
+
+LINEUPS FIX (see fetch_lineups below):
+365Scores can return a non-null lineups object on homeCompetitor/
+awayCompetitor BEFORE the official squad is actually published -- an
+object with an empty "members" list (and often "formation": ""). The old
+check here was:
+
+    if not home_lineups and not away_lineups:
+        return None
+
+which only catches the case where the key is missing/None entirely. A
+`{"formation": "", "members": []}` shell is truthy, so it sailed straight
+through, got joined against an empty roster, and was returned as a
+"successful" empty-squad result. Confirmed against a real stored
+document: lineups.homeLineup.coach.name == "Unknown" (meaning no
+"Management" member existed at all) with formation == "" and empty
+players/bench arrays on both sides -- i.e. `members` was genuinely [].
+
+That empty result got forwarded and stored downstream with
+lineupsFetched=true and no way to retry. Fixed by requiring at least one
+side to actually have non-empty `members` before returning a result;
+otherwise return None so poller.py's existing retry-until-success logic
+(_fetch_and_forward_lineups / should_fetch_lineups in poller.py) tries
+again on a later poll cycle instead of locking in an empty stub.
 """
 
 from __future__ import annotations
@@ -192,22 +217,45 @@ def fetch_game_details(
         return None
 
 
+def _lineup_has_real_squad(lineup: Optional[Dict[str, Any]]) -> bool:
+    """
+    True only if a lineup object actually has player entries in it.
+
+    365Scores can return a non-null lineups object on a competitor BEFORE
+    the official squad is published -- e.g. {"formation": "", "members": []}.
+    That object is truthy (`if not lineup` sees it as present), but carries
+    zero real squad data. Treat that as "not ready" so callers never
+    mistake a shell object for a real, storable lineup.
+    """
+    if not lineup:
+        return False
+    members = lineup.get("members") or []
+    return len(members) > 0
+
+
 def fetch_lineups(
     game_id: str, away_id: int, home_id: int, competition_id: int
 ) -> Optional[Dict[str, Any]]:
     """
     Fetch only lineups from the game details endpoint.
 
-    Returns:
+    Returns None if lineups aren't genuinely published yet -- either the
+    key is missing entirely, OR 365Scores has only returned an empty
+    pre-publish placeholder (non-null object, but zero members) on BOTH
+    sides. Callers must treat None as "try again later, nothing to
+    store" -- this function will never return a result where both sides
+    have zero members, since that shape gets permanently persisted
+    downstream with no retry mechanism once forwarded.
+
+    Returns (on success -- at least one side has a real squad):
         {
+            "fixture_id": "wc26_<game_id>",
             "home": {
                 "formation": "4-3-3",
-                "status": "Confirmed",
                 "members": [...]
             },
             "away": {
                 "formation": "4-2-3-1",
-                "status": "Confirmed",
                 "members": [...]
             }
         }
@@ -226,8 +274,20 @@ def fetch_lineups(
     home_lineups = home_competitor.get("lineups")
     away_lineups = away_competitor.get("lineups")
 
-    if not home_lineups and not away_lineups:
-        logger.debug(f"No lineups available for {game_id}")
+    # FIX: check for actual squad content, not just object presence. A
+    # pre-publish placeholder dict is truthy but has zero real players --
+    # the old `if not home_lineups and not away_lineups` check let that
+    # straight through.
+    if not _lineup_has_real_squad(home_lineups) and not _lineup_has_real_squad(
+        away_lineups
+    ):
+        home_member_count = len((home_lineups or {}).get("members") or [])
+        away_member_count = len((away_lineups or {}).get("members") or [])
+        logger.debug(
+            f"Lineups not yet published for {game_id} "
+            f"(home_members={home_member_count}, away_members={away_member_count}) "
+            f"-- will retry on next poll cycle"
+        )
         return None
 
     # Player names live in a separate top-level "members" array on the
@@ -617,6 +677,14 @@ def fetch_complete_match_data(
 ) -> Optional[Dict[str, Any]]:
     """
     Fetch all match data: details, lineups, statistics, and commentary in one go.
+
+    NOTE: the "lineups" key here uses the RAW homeCompetitor/awayCompetitor
+    .lineups objects directly -- unlike fetch_lineups(), this does NOT
+    filter out empty pre-publish placeholders. If you're using this
+    function's lineups output for anything that gets persisted (as
+    opposed to transient display), check _lineup_has_real_squad() on
+    each side yourself before storing, or use fetch_lineups() instead,
+    which already guards this.
     """
     data = fetch_game_details(game_id, away_id, home_id, competition_id)
 
