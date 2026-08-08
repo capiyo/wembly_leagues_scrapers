@@ -38,6 +38,32 @@ side to actually have non-empty `members` before returning a result;
 otherwise return None so poller.py's existing retry-until-success logic
 (_fetch_and_forward_lineups / should_fetch_lineups in poller.py) tries
 again on a later poll cycle instead of locking in an empty stub.
+
+STATISTICS BUG (see extract_statistics_from_game below):
+extract_statistics_from_game() was reading top-level `game` keys
+(homePossession, homeShots, homeCorners, ...) that DO NOT EXIST on the
+/web/game/ response. Checked against the repo's own committed sample,
+game_4627864.json: the full set of top-level keys on `game` is
+actualPlayTime, awayCompetitor, chartEvents, competitionDisplayName,
+hasStats, homeCompetitor, id, statusGroup, statusId, statusText,
+topPerformers, venue, widgets, etc. -- none of the guessed
+home*/away* stat fields are present at the top level OR nested inside
+homeCompetitor/awayCompetitor. The sample has hasStats: True, so
+365Scores does have stats for this game -- they're served through one
+of the `widgets` entries (e.g. a SportRadar-hosted LMT/Momentum widget
+URL), the same pattern commentary uses (playByPlay.feedURL) instead of
+living directly on /web/game/.
+
+Because nobody has captured a raw response from one of those widget
+URLs yet, there is no verified field shape to parse, and guessing again
+would repeat the exact mistake that caused the original bug (nulls
+silently written to storage as if they were real zero-value stats).
+Instead, extract_statistics_from_game() now fails LOUDLY: it logs an
+error the first time it's called and returns None instead of a
+dict full of Nones, so callers can no longer mistake "we never
+implemented this" for "the match legitimately has no stats yet". See
+the function docstring for what still needs to happen before this can
+return real data.
 """
 
 from __future__ import annotations
@@ -368,42 +394,67 @@ def classify_match_phase(status_text: Optional[str]) -> Optional[str]:
     return None
 
 
-def extract_statistics_from_game(game: Dict[str, Any]) -> Dict[str, Any]:
+# Set to True the first time extract_statistics_from_game() logs its
+# "not implemented" error, so the poller's logs get one loud warning per
+# process instead of one per snapshot (every halftime/stopped/fulltime
+# transition, for every live match). The underlying problem never
+# changes call to call, so repeating the same error every ~15s adds
+# noise without adding information.
+_STATS_UNIMPLEMENTED_WARNED = False
+
+
+def extract_statistics_from_game(game: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Build the statistics payload from an already-fetched `game` object.
-    Lets callers that already hold a `game` dict (e.g. the poller's live
-    loop) skip a redundant fetch_game_details() call.
+
+    STATUS: NOT IMPLEMENTED. The home*/away* fields this used to read
+    (homePossession, homeShots, homeCorners, homeFouls, homeYellowCards,
+    homeRedCards, homeOffsides, homePasses, homePassAccuracy, and the
+    away* equivalents) do not exist anywhere on the `game` object --
+    verified against the repo's committed sample response,
+    game_4627864.json. Real statistics for a match with hasStats: True
+    are served through one of the URLs in game["widgets"] (SportRadar-
+    hosted, e.g. an LMT/Momentum widget), the same way commentary lives
+    behind playByPlay.feedURL instead of directly on /web/game/. Nobody
+    has captured a raw response from one of those widget URLs yet, so
+    there is no confirmed field shape to parse.
+
+    Returns None unconditionally right now, on purpose -- NOT a dict of
+    Nones. Returning a fully-populated-looking dict where every value
+    happens to be None is exactly how the original bug went undetected:
+    it stores and forwards indistinguishably from "this match really has
+    no stats", and both poller.py and downstream storage treat it as a
+    successful snapshot. Callers (see fetch_statistics() and
+    fetch_complete_match_data() below) must treat this None the same way
+    fetch_lineups() treats an unpublished lineup: "nothing to store".
+
+    To implement this for real:
+      1. Capture one raw response body from a widgetUrl in
+         game["widgets"] for a live match (e.g. the SportRadarLMT_V3
+         entry) and inspect its actual field names.
+      2. Replace this function's body with a parser for that confirmed
+         shape.
+      3. Remove the _STATS_UNIMPLEMENTED_WARNED short-circuit below.
     """
-    return {
-        "home": {
-            "possession": game.get("homePossession"),
-            "shots": game.get("homeShots"),
-            "shots_on_target": game.get("homeShotsOnTarget"),
-            "shots_off_target": game.get("homeShotsOffTarget"),
-            "corners": game.get("homeCorners"),
-            "fouls": game.get("homeFouls"),
-            "yellow_cards": game.get("homeYellowCards"),
-            "red_cards": game.get("homeRedCards"),
-            "offsides": game.get("homeOffsides"),
-            "passes": game.get("homePasses"),
-            "pass_accuracy": game.get("homePassAccuracy"),
-        },
-        "away": {
-            "possession": game.get("awayPossession"),
-            "shots": game.get("awayShots"),
-            "shots_on_target": game.get("awayShotsOnTarget"),
-            "shots_off_target": game.get("awayShotsOffTarget"),
-            "corners": game.get("awayCorners"),
-            "fouls": game.get("awayFouls"),
-            "yellow_cards": game.get("awayYellowCards"),
-            "red_cards": game.get("awayRedCards"),
-            "offsides": game.get("awayOffsides"),
-            "passes": game.get("awayPasses"),
-            "pass_accuracy": game.get("awayPassAccuracy"),
-        },
-        "minute": int(game.get("gameTime", 0) or 0),
-        "status_text": game.get("statusText"),
-    }
+    global _STATS_UNIMPLEMENTED_WARNED
+    if not _STATS_UNIMPLEMENTED_WARNED:
+        logger.error(
+            "extract_statistics_from_game() is not implemented: the "
+            "home*/away* stat fields it used to read do not exist on the "
+            "/web/game/ response (confirmed against game_4627864.json). "
+            "Real stats live behind one of game['widgets'] (SportRadar-"
+            "hosted), which has not been captured/parsed yet. Returning "
+            "None instead of a dict of Nones so this stops being stored "
+            "as a fake zero-value statistics snapshot. See this "
+            "function's docstring for what's needed to implement it."
+        )
+        _STATS_UNIMPLEMENTED_WARNED = True
+    else:
+        logger.debug(
+            "extract_statistics_from_game() called again -- still not "
+            "implemented, returning None (see earlier error log)."
+        )
+    return None
 
 
 def fetch_statistics(
@@ -415,6 +466,10 @@ def fetch_statistics(
     NOTE: this makes its own fetch_game_details() call. If you already
     have a `game` object on hand, prefer extract_statistics_from_game(game)
     to avoid a redundant network request.
+
+    Returns None -- see extract_statistics_from_game()'s docstring.
+    Statistics extraction is not implemented; the guessed home*/away*
+    fields it used to read don't exist on this endpoint's response.
     """
     data = fetch_game_details(game_id, away_id, home_id, competition_id)
 
@@ -685,6 +740,13 @@ def fetch_complete_match_data(
     opposed to transient display), check _lineup_has_real_squad() on
     each side yourself before storing, or use fetch_lineups() instead,
     which already guards this.
+
+    NOTE: "statistics" now comes from extract_statistics_from_game(),
+    same as fetch_statistics() -- it used to duplicate the (broken)
+    field-guessing inline here separately, which meant a second copy of
+    the same bug to fix. It will be None until statistics extraction is
+    actually implemented; see extract_statistics_from_game()'s
+    docstring.
     """
     data = fetch_game_details(game_id, away_id, home_id, competition_id)
 
@@ -700,35 +762,7 @@ def fetch_complete_match_data(
             "home": game.get("homeCompetitor", {}).get("lineups", {}),
             "away": game.get("awayCompetitor", {}).get("lineups", {}),
         },
-        "statistics": {
-            "home": {
-                "possession": game.get("homePossession"),
-                "shots": game.get("homeShots"),
-                "shots_on_target": game.get("homeShotsOnTarget"),
-                "shots_off_target": game.get("homeShotsOffTarget"),
-                "corners": game.get("homeCorners"),
-                "fouls": game.get("homeFouls"),
-                "yellow_cards": game.get("homeYellowCards"),
-                "red_cards": game.get("homeRedCards"),
-                "offsides": game.get("homeOffsides"),
-                "passes": game.get("homePasses"),
-                "pass_accuracy": game.get("homePassAccuracy"),
-            },
-            "away": {
-                "possession": game.get("awayPossession"),
-                "shots": game.get("awayShots"),
-                "shots_on_target": game.get("awayShotsOnTarget"),
-                "shots_off_target": game.get("awayShotsOffTarget"),
-                "corners": game.get("awayCorners"),
-                "fouls": game.get("awayFouls"),
-                "yellow_cards": game.get("awayYellowCards"),
-                "red_cards": game.get("awayRedCards"),
-                "offsides": game.get("awayOffsides"),
-                "passes": game.get("awayPasses"),
-                "pass_accuracy": game.get("awayPassAccuracy"),
-            },
-            "minute": int(game.get("gameTime", 0) or 0),
-        },
+        "statistics": extract_statistics_from_game(game),
         "commentary": game.get("commentary", []),
         "score": {
             "home": game.get("homeCompetitor", {}).get("score", 0),
