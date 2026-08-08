@@ -694,6 +694,47 @@ class Poller:
                     "away": self._team_lineup_for_forwarder(lineups.get("away", {})),
                 }
 
+                # FIX: fetch_lineups() only confirms that at least one side
+                # has a NAMED member (see threesixtyfive._lineup_has_real_squad) --
+                # it says nothing about that member's statusText. Rust's
+                # PlayerPayload only ever gets populated with entries whose
+                # statusText is "Starting" (players) or "Substitute" (bench),
+                # via _team_lineup_for_forwarder/_map_lineup_player above.
+                # Those are two different readiness criteria: a side can have
+                # real, named members and still shape into empty
+                # players/bench/coach lists here if none of those members'
+                # statusText matched what we filter on -- e.g. a provisional
+                # squad list published under a statusText value other than
+                # "Starting"/"Substitute"/"Management". Re-check readiness
+                # AFTER shaping, using what will actually be stored, instead
+                # of trusting the pre-shape check alone -- otherwise this is
+                # exactly what produces a permanently empty, locked-in
+                # lineup (formation="", coach.name="Unknown", players=[],
+                # bench=[]) with lineupsFetched=true.
+                home_status_texts = sorted(
+                    {
+                        m.get("statusText")
+                        for m in (lineups.get("home", {}) or {}).get("members", [])
+                    }
+                )
+                away_status_texts = sorted(
+                    {
+                        m.get("statusText")
+                        for m in (lineups.get("away", {}) or {}).get("members", [])
+                    }
+                )
+                home_ready = len(lineups_shaped["home"]["players"]) > 0
+                away_ready = len(lineups_shaped["away"]["players"]) > 0
+                if not home_ready and not away_ready:
+                    logger.warning(
+                        f"⚠️ {match_id}: fetch_lineups() returned named members "
+                        f"but none shaped into a starting XI on either side -- "
+                        f"treating as not ready. home statusText values seen: "
+                        f"{home_status_texts}, away statusText values seen: "
+                        f"{away_status_texts}"
+                    )
+                    return False
+
                 lineups_payload = {
                     "fixtureId": match_id,
                     "homeTeam": home_team,
