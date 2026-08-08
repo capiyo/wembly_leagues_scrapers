@@ -42,7 +42,7 @@ THREESIXTYFIVE_TIMEZONE = "Africa/Nairobi"
 
 # Polling
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
-SCRAPE_DAYS_AHEAD = 7
+SCRAPE_DAYS_AHEAD = 20
 
 # ============================================================
 # SCRAPE WINDOW (anchored on today)
