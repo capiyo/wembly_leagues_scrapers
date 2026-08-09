@@ -1118,6 +1118,7 @@ def main():
         sys.exit(1)
 
     api_url = os.environ.get("FANCLASH_API", "https://clash-api-m5mr.onrender.com/api")
+    
 
     store = FixtureStore(mongo_uri)
     forwarder = Forwarder(api_url)
