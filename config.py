@@ -51,7 +51,7 @@ SCRAPE_DAYS_AHEAD = 20
 # leagues_scraper.py -- anchors strictly on "today"
 # (datetime.now(UTC).date()), no reference-date creep/high-water-mark
 # heuristics.
-SCRAPE_WINDOW_DAYS = 13
+SCRAPE_WINDOW_DAYS = 15
 
 # ============================================================
 # LEAGUE-BASED FIXTURES (leagues_scraper.py)
