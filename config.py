@@ -114,7 +114,7 @@ LEAGUES = {
 # harmless dead weight now that nothing calls those methods from the
 # scrape path.
 REFERENCE_DATE_DEFAULT = "2026-08-13"
-REFERENCE_WINDOW_DAYS = 13
+REFERENCE_WINDOW_DAYS = 15 
 
 # Order matters here -- this is also the priority order used when
 # building the "top of feed" response (EPL first, down to Community

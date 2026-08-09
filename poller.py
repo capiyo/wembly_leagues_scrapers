@@ -8,6 +8,20 @@ a rolling config.SCRAPE_DAYS_AHEAD-day window across every league in
 config.LEAGUES, instead of scraper.scrape_world_cup_fixtures(). This
 covers both the reactive trigger (fired right after a match is archived)
 and the twice-daily scheduled backstop below.
+
+ASYNC FIX: _trigger_rescrape() used to call scrape_all_leagues_window()
+synchronously, inline, inside the poll loop. That function makes a real
+network call per league (365Scores) plus Mongo writes, so running it
+inline stalled polling of every other live match for the entire
+duration of the rescrape -- multiple seconds, sometimes longer, during
+which live scores/commentary/events for every other in-progress match
+went stale. _trigger_rescrape() now dispatches the actual scrape onto a
+daemon background thread and returns immediately, guarded by a
+non-blocking lock so overlapping triggers (several matches archiving
+close together, or the scheduled backstop landing mid-rescrape) don't
+spawn concurrent scrapes hitting 365Scores/Mongo at the same time --
+a second trigger while one is already running is simply skipped, since
+the in-flight rescrape already covers the same window.
 """
 
 from __future__ import annotations
@@ -15,6 +29,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
@@ -256,6 +271,12 @@ class Poller:
         self.last_scheduled_scrape = (
             datetime.now(timezone.utc) - self.SCHEDULED_RESCRAPE_INTERVAL
         )
+        # Guards _trigger_rescrape so overlapping calls (reactive trigger
+        # firing for several matches archiving close together, or the
+        # scheduled backstop landing mid-rescrape) don't spawn concurrent
+        # scrapes hitting 365Scores/Mongo at the same time. Non-blocking:
+        # a call that can't acquire it is simply skipped, not queued.
+        self._rescrape_lock = threading.Lock()
 
     def start(self):
         self.running = True
@@ -1024,9 +1045,8 @@ class Poller:
         self.forwarder.forward_live_update(live_update)
 
     def _trigger_rescrape(self, reason: str = ""):
-        """Re-run league fixture discovery so a freshly-archived slot in
-        `games` gets refilled right away, instead of waiting for the next
-        scheduled backstop.
+        """Kick off a league rescrape on a background thread instead of
+        running it inline in the poll loop.
 
         leagues_scraper.scrape_all_leagues_window() upserts league
         fixtures kicking off within config.SCRAPE_WINDOW_DAYS days of
@@ -1043,24 +1063,45 @@ class Poller:
         service (its own resolver loop, on its own schedule), which
         writes into this same shared `games` collection.
 
-        Runs synchronously in the poll loop -- a slow 365Scores response
-        here will delay polling of other live matches for that cycle. If
-        that becomes a problem in practice (e.g. several matches finishing
-        around the same time across leagues), move the body of this into
-        a daemon thread instead of calling it inline."""
-        try:
-            logger.info(f"🔄 Triggering league rescrape ({reason})...")
-            results = leagues_scraper.scrape_all_leagues_window(
-                self.store,
-                days_ahead=config.SCRAPE_WINDOW_DAYS,
-                forwarder=self.forwarder,
-            )
-            total = sum(results.values())
-            logger.info(
-                f"✅ League rescrape complete: {results} (total={total} fixtures upserted)"
-            )
-        except Exception as e:
-            logger.error(f"❌ League rescrape failed: {e}")
+        ASYNC: scrape_all_leagues_window() makes a real network call per
+        league (365Scores) plus Mongo writes -- running that inline used
+        to stall polling of every OTHER live match for the full duration
+        of the rescrape, sometimes several seconds. This now dispatches
+        the actual work to a daemon background thread and returns
+        immediately, so the 3s poll loop stays responsive regardless of
+        how slow the rescrape is.
+
+        Guarded by a non-blocking lock: if a rescrape is already running
+        when this fires again (e.g. two matches archive within the same
+        few seconds, or the scheduled backstop lands mid-rescrape), the
+        new trigger is skipped entirely rather than queued -- the
+        in-flight rescrape already covers the same window, so a second
+        concurrent one would just double up 365Scores calls and Mongo
+        writes for no benefit. Exceptions raised inside the thread are
+        caught and logged there directly, since they would otherwise
+        never reach the try/except in start()."""
+        if not self._rescrape_lock.acquire(blocking=False):
+            logger.info(f"⏭️ Rescrape already in progress, skipping trigger ({reason})")
+            return
+
+        def _run():
+            try:
+                logger.info(f"🔄 Triggering league rescrape ({reason})...")
+                results = leagues_scraper.scrape_all_leagues_window(
+                    self.store,
+                    days_ahead=config.SCRAPE_WINDOW_DAYS,
+                    forwarder=self.forwarder,
+                )
+                total = sum(results.values())
+                logger.info(
+                    f"✅ League rescrape complete: {results} (total={total} fixtures upserted)"
+                )
+            except Exception as e:
+                logger.error(f"❌ League rescrape failed: {e}", exc_info=True)
+            finally:
+                self._rescrape_lock.release()
+
+        threading.Thread(target=_run, daemon=True, name="league-rescrape").start()
 
     def _finalize_match_result(self, match: Dict[str, Any]):
         match_id = match.get("matchId")
@@ -1118,7 +1159,6 @@ def main():
         sys.exit(1)
 
     api_url = os.environ.get("FANCLASH_API", "https://clash-api-m5mr.onrender.com/api")
-    
 
     store = FixtureStore(mongo_uri)
     forwarder = Forwarder(api_url)
