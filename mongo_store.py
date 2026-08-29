@@ -13,6 +13,26 @@ NOTE: Flashscore cross-reference bookkeeping (flashscore_id,
 flashscore_resolve_attempts, needs_flashscore_resolution(), etc.) has been
 removed -- commentary now comes from 365Scores via sources/threesixtyfive.py,
 so there's no separate ID resolution step needed.
+
+STALE-FIXTURE FIX (move_to_history / get_all_fixtures below):
+Confirmed root cause of matches staying visibly "LIVE" / re-fetching
+commentary indefinitely after they'd already been archived on the Rust
+side: move_to_history() here only ever set a movedToHistory=True flag --
+it never deleted the local document. get_all_fixtures() then had no
+status filter at all, so poll_once() kept handing that same archived
+match back to _process_match() on every cycle, forever. Whenever the
+current in-memory status on that stale local doc still read anything
+other than "completed" (a status-correction race, or simply never having
+been updated locally in the first place since poller.py only ever called
+forwarder.move_to_history() -- the remote Rust call -- and never called
+this local method at all), _fetch_live_updates() kept running for it:
+re-fetching game details, re-pushing the same commentary entries with a
+fresh createdAt timestamp every cycle, and in some paths re-forcing
+status back to "live". Two independent fixes below close this from both
+ends: move_to_history() now actually deletes the local doc (so it's
+gone even if something calls it), and get_all_fixtures() now excludes
+status="completed" outright (so even an un-deleted completed doc can
+never re-enter the live poll pipeline again).
 """
 
 from __future__ import annotations
@@ -226,8 +246,27 @@ class FixtureStore:
         return list(self._collection.find({"status": status}))
 
     def get_all_fixtures(self) -> List[Dict[str, Any]]:
-        """Get all fixtures (all statuses)."""
-        return list(self._collection.find({}))
+        """Get all fixtures the poller still needs to actively manage.
+
+        FIX: previously `find({})` with no filter at all -- returned
+        every fixture ever created, including matches long since
+        completed and archived on the Rust side. Since move_to_history()
+        below (before this fix) never actually deleted the local
+        document, a completed match kept coming back through this method
+        on every single poll cycle forever, letting it re-enter
+        _process_match() / _fetch_live_updates() indefinitely -- the
+        root cause of matches staying stuck on "LIVE" with commentary
+        timestamps that kept climbing long after the match had actually
+        ended and been archived.
+
+        Excluding status="completed" here is deliberate defense in depth:
+        even if some other code path recreates or fails to delete a
+        completed doc, it can never re-enter the active poll set again
+        once this filter is in place. Everything else (upcoming, soon,
+        live, or any legacy/unexpected status value) still comes through
+        unfiltered, same as before.
+        """
+        return list(self._collection.find({"status": {"$ne": "completed"}}))
 
     def get_fixtures_in_window(self, days_ahead: int = 7) -> List[Dict[str, Any]]:
         """Get fixtures within the next N days."""
@@ -729,14 +768,51 @@ class FixtureStore:
             },
         )
 
-    def move_to_history(self, match_id: str) -> None:
-        """Mark a match as moved to history."""
-        self._collection.update_one(
-            {"matchId": match_id}, {"$set": {"movedToHistory": True}}
-        )
+    def move_to_history(self, match_id: str) -> bool:
+        """Archive a match by removing it from the local `games`
+        collection entirely.
+
+        FIX: this previously only set movedToHistory=True and left the
+        document sitting in place -- meaning get_all_fixtures() (before
+        its own fix, see above) kept returning it forever, and even
+        after that fix, a completed doc lingering here indefinitely was
+        still unnecessary dead weight the poller had to filter around on
+        every single cycle. The Rust-side document (the one
+        clients/API responses actually read from `games`/`fixtures`) is
+        deleted separately by forwarder.move_to_history()'s HTTP call to
+        the Rust API's own move_completed_to_history handler -- this
+        method only ever managed the POLLER's own local copy in Mongo,
+        which is a completely separate write path from that HTTP call.
+
+        Returns True if a local document was actually found and deleted,
+        False if there was nothing to delete (e.g. already removed, or
+        this local copy never existed for this match_id) -- callers can
+        use this the same way they already treat forwarder.move_to_history()'s
+        boolean success return.
+        """
+        result = self._collection.delete_one({"matchId": match_id})
+        deleted = result.deleted_count > 0
+        if deleted:
+            logger.info(f"🗑️ {match_id}: removed from local fixtures collection")
+        else:
+            logger.debug(
+                f"{match_id}: move_to_history() found nothing to delete locally"
+            )
+        return deleted
 
     def archive_completed_fixtures(self, hours: int = 24) -> int:
-        """Archive completed fixtures older than N hours."""
+        """Archive completed fixtures older than N hours.
+
+        NOTE: this predates move_to_history()'s fix above and is a
+        separate, softer mechanism -- it only flags movedToHistory=True
+        rather than deleting. Kept as-is since nothing currently calls
+        it from poller.py (grep confirms no call sites), but be aware it
+        does NOT get the same "actually remove the stale doc" behavior
+        move_to_history() now has. If this is ever wired up as a
+        scheduled sweep, prefer calling move_to_history() per-match
+        instead of this, or update this method to delete_many() instead
+        of update_many() to match.
+        """
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
         result = self._collection.update_many(
             {
@@ -828,7 +904,14 @@ class FixtureStore:
     # ============================================================
 
     def delete_old_fixtures(self, days: int = 30) -> int:
-        """Delete fixtures older than N days (that are archived)."""
+        """Delete fixtures older than N days (that are archived).
+
+        NOTE: with move_to_history() now deleting matches immediately on
+        archival, this method is mostly a backstop for anything that
+        still has movedToHistory=True set via the older
+        archive_completed_fixtures() path above, or any doc that somehow
+        survives move_to_history() (e.g. it was never called for that
+        match). Harmless to leave as a periodic safety net either way."""
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         result = self._collection.delete_many(
             {
