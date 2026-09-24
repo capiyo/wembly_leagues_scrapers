@@ -51,7 +51,14 @@ SCRAPE_DAYS_AHEAD = 20
 # leagues_scraper.py -- anchors strictly on "today"
 # (datetime.now(UTC).date()), no reference-date creep/high-water-mark
 # heuristics.
-SCRAPE_WINDOW_DAYS = 15
+SCRAPE_WINDOW_DAYS = 10
+
+# If a league has zero non-qualifier fixtures inside SCRAPE_WINDOW_DAYS,
+# widen the window to this many days instead (same fetched fixture list,
+# just re-filtered with a later cutoff -- no extra API call). Covers
+# international breaks / gaps between rounds that are longer than the
+# normal window.
+SCRAPE_WINDOW_DAYS_FALLBACK = 16
 
 # ============================================================
 # LEAGUE-BASED FIXTURES (leagues_scraper.py)
@@ -114,7 +121,7 @@ LEAGUES = {
 # harmless dead weight now that nothing calls those methods from the
 # scrape path.
 REFERENCE_DATE_DEFAULT = "2026-08-13"
-REFERENCE_WINDOW_DAYS = 15 
+REFERENCE_WINDOW_DAYS = 15
 
 # Order matters here -- this is also the priority order used when
 # building the "top of feed" response (EPL first, down to Community

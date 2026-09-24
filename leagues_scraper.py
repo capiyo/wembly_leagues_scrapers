@@ -330,10 +330,67 @@ def scrape_one_round(
 # ============================================================
 
 
+def _filter_games_in_window(
+    games: list,
+    league_cfg: dict,
+    reference: datetime.datetime,
+    days_ahead: int,
+) -> tuple[list, int, int]:
+    """Filter an already-fetched `games` list down to the ones landing in
+    [reference, reference + days_ahead days], excluding qualifying rounds.
+    Factored out of scrape_league_fixtures_window() so the same fetched
+    list can be re-filtered with a wider cutoff (the fallback window)
+    without a second API call. Returns (in_window, skipped_before_window,
+    skipped_qualifier).
+    """
+    cutoff = reference + datetime.timedelta(days=days_ahead)
+
+    in_window = []
+    skipped_before_window = 0
+    skipped_qualifier = 0
+    for g in games:
+        kickoff = _parse_kickoff(g.get("startTime"))
+
+        # Lower bound: must be at or after `reference`, UNLESS the game
+        # is actually live right now -- catches a match that kicked off
+        # slightly before the window but is still being played. This is
+        # deliberately narrower than "not finished", which is true for
+        # every upcoming fixture regardless of date and was the original
+        # bug: it let e.g. an Aug-8 FA Cup qualifier through a window
+        # anchored on Aug 13, because "upcoming" games are never
+        # "finished" no matter how far away their kickoff is.
+        is_live_now = _status_to_internal(g.get("statusText", "")) == "live"
+        # Compare calendar dates, not exact datetimes, for the lower bound.
+        # `reference` can advance to "tomorrow" at any point during today
+        # (the twice-daily backstop fires on a fixed clock, unrelated to
+        # any specific match's kickoff time) -- comparing full datetimes
+        # meant a fixture kicking off later THAT SAME DAY as the old
+        # reference value could get excluded hours before it even played,
+        # simply because the shared reference had already ticked over to
+        # the next day. A fixture is only "before the window" once its
+        # kickoff falls on an earlier calendar date than the reference.
+        if kickoff.date() < reference.date() and not is_live_now:
+            skipped_before_window += 1
+            continue
+
+        # Upper bound: must not kick off after the window ends.
+        if kickoff > cutoff:
+            continue
+
+        # Exclude qualifying/preliminary rounds regardless of date.
+        if _is_qualifying_round(g, league_cfg["name"]):
+            skipped_qualifier += 1
+            continue
+
+        in_window.append(g)
+
+    return in_window, skipped_before_window, skipped_qualifier
+
+
 def scrape_league_fixtures_window(
     store: FixtureStore,
     league_key: str,
-    days_ahead: int = 7,
+    days_ahead: int = config.SCRAPE_WINDOW_DAYS,
     reference_override: Optional[datetime.datetime] = None,
     forwarder: Optional[Forwarder] = None,
 ) -> int:
@@ -418,46 +475,9 @@ def scrape_league_fixtures_window(
         # simpler to reason about when several leagues are wired in.
         reference = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    cutoff = reference + datetime.timedelta(days=days_ahead)
-
-    in_window = []
-    skipped_before_window = 0
-    skipped_qualifier = 0
-    for g in games:
-        kickoff = _parse_kickoff(g.get("startTime"))
-
-        # Lower bound: must be at or after `reference`, UNLESS the game
-        # is actually live right now -- catches a match that kicked off
-        # slightly before the window but is still being played. This is
-        # deliberately narrower than "not finished", which is true for
-        # every upcoming fixture regardless of date and was the original
-        # bug: it let e.g. an Aug-8 FA Cup qualifier through a window
-        # anchored on Aug 13, because "upcoming" games are never
-        # "finished" no matter how far away their kickoff is.
-        is_live_now = _status_to_internal(g.get("statusText", "")) == "live"
-        # Compare calendar dates, not exact datetimes, for the lower bound.
-        # `reference` can advance to "tomorrow" at any point during today
-        # (the twice-daily backstop fires on a fixed clock, unrelated to
-        # any specific match's kickoff time) -- comparing full datetimes
-        # meant a fixture kicking off later THAT SAME DAY as the old
-        # reference value could get excluded hours before it even played,
-        # simply because the shared reference had already ticked over to
-        # the next day. A fixture is only "before the window" once its
-        # kickoff falls on an earlier calendar date than the reference.
-        if kickoff.date() < reference.date() and not is_live_now:
-            skipped_before_window += 1
-            continue
-
-        # Upper bound: must not kick off after the window ends.
-        if kickoff > cutoff:
-            continue
-
-        # Exclude qualifying/preliminary rounds regardless of date.
-        if _is_qualifying_round(g, league_cfg["name"]):
-            skipped_qualifier += 1
-            continue
-
-        in_window.append(g)
+    in_window, skipped_before_window, skipped_qualifier = _filter_games_in_window(
+        games, league_cfg, reference, days_ahead
+    )
 
     if skipped_before_window or skipped_qualifier:
         logger.info(
@@ -468,13 +488,35 @@ def scrape_league_fixtures_window(
         )
 
     if not in_window:
-        logger.info(
-            "%s: no non-qualifier fixtures within the %d-day window from %s.",
-            league_cfg["name"],
-            days_ahead,
-            reference.strftime("%Y-%m-%d"),
-        )
-        return 0
+        # Nothing landed in the normal window -- before giving up, retry
+        # with the wider fallback window (config.SCRAPE_WINDOW_DAYS_FALLBACK,
+        # 16 days by default). This re-filters the same already-fetched
+        # `games` list with a later cutoff, so it's free API-call-wise; it
+        # just covers gaps (international breaks, mid-season pauses) that
+        # are longer than the normal rolling window.
+        fallback_days = config.SCRAPE_WINDOW_DAYS_FALLBACK
+        if fallback_days > days_ahead:
+            logger.info(
+                "%s: no non-qualifier fixtures within the %d-day window from %s -- "
+                "retrying with the %d-day fallback window.",
+                league_cfg["name"],
+                days_ahead,
+                reference.strftime("%Y-%m-%d"),
+                fallback_days,
+            )
+            in_window, _, _ = _filter_games_in_window(
+                games, league_cfg, reference, fallback_days
+            )
+            days_ahead = fallback_days
+
+        if not in_window:
+            logger.info(
+                "%s: no non-qualifier fixtures within the %d-day window from %s.",
+                league_cfg["name"],
+                days_ahead,
+                reference.strftime("%Y-%m-%d"),
+            )
+            return 0
 
     logger.info(
         "%s: %d/%d fixtures fall within the %d-day window from %s (qualifiers excluded)",
@@ -557,8 +599,8 @@ def main() -> None:
     parser.add_argument(
         "--days-ahead",
         type=int,
-        default=config.SCRAPE_DAYS_AHEAD,
-        help=f"Window size in days for --window (default: {config.SCRAPE_DAYS_AHEAD}, from config.SCRAPE_DAYS_AHEAD).",
+        default=config.SCRAPE_WINDOW_DAYS,
+        help=f"Window size in days for --window (default: {config.SCRAPE_WINDOW_DAYS}, from config.SCRAPE_WINDOW_DAYS).",
     )
     parser.add_argument(
         "--full",
