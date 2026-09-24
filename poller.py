@@ -259,6 +259,19 @@ class Poller:
     # single already-running process.
     SCHEDULED_RESCRAPE_INTERVAL = timedelta(hours=12)  # twice a day
 
+    # Idle/recovery behavior: when nothing is live and nothing is within
+    # ACTIVE_WINDOW_MINUTES of kickoff, the poller stops doing full
+    # per-match processing (which hits 365Scores) and just sleeps,
+    # waking up every IDLE_RECHECK_INTERVAL_SECONDS to cheaply re-check
+    # fixture times from Mongo (no external API calls) until something
+    # comes back into the active window.
+    ACTIVE_WINDOW_MINUTES = 120  # 2 hours before kickoff
+    # Small grace period so a match whose kickoff passed moments ago
+    # (while idling) still counts as active instead of waiting for the
+    # next idle recheck to notice it should have gone live.
+    ACTIVE_WINDOW_GRACE_MINUTES = 15
+    IDLE_RECHECK_INTERVAL_SECONDS = 300  # 5 minutes
+
     def __init__(self, store: FixtureStore, forwarder: Forwarder):
         self.store = store
         self.forwarder = forwarder
@@ -277,6 +290,10 @@ class Poller:
         # scrapes hitting 365Scores/Mongo at the same time. Non-blocking:
         # a call that can't acquire it is simply skipped, not queued.
         self._rescrape_lock = threading.Lock()
+        # Tracks whether the last cycle was idle, purely so the "resumed
+        # active polling" log line only fires on the transition back in,
+        # not on every single active cycle.
+        self._was_idle = False
 
     def start(self):
         self.running = True
@@ -284,12 +301,79 @@ class Poller:
 
         while self.running:
             try:
-                self.poll_once()
+                self._maybe_scheduled_rescrape()
+
+                all_fixtures = self.store.get_all_fixtures()
+
+                if self._needs_active_polling(all_fixtures):
+                    if self._was_idle:
+                        logger.info(
+                            "▶️ Match within %d minutes of kickoff (or live) -- "
+                            "resuming active polling.",
+                            self.ACTIVE_WINDOW_MINUTES,
+                        )
+                        self._was_idle = False
+                    self.poll_once(all_fixtures)
+                    self.poll_count += 1
+                    time.sleep(3)
+                else:
+                    if not self._was_idle:
+                        logger.info(
+                            "💤 No live matches and nothing within %d minutes of "
+                            "kickoff -- idling, rechecking every %ds.",
+                            self.ACTIVE_WINDOW_MINUTES,
+                            self.IDLE_RECHECK_INTERVAL_SECONDS,
+                        )
+                        self._was_idle = True
+                    time.sleep(self.IDLE_RECHECK_INTERVAL_SECONDS)
             except Exception as e:
                 logger.error(f"Poll cycle failed: {e}", exc_info=True)
+                time.sleep(3)
 
-            self.poll_count += 1
-            time.sleep(3)
+    def _parse_kickoff_utc(self, match: Dict[str, Any]) -> Optional[datetime]:
+        kickoff_utc = match.get("kickoffUtc")
+        if isinstance(kickoff_utc, str):
+            try:
+                kickoff_utc = datetime.fromisoformat(kickoff_utc.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        if isinstance(kickoff_utc, datetime):
+            if kickoff_utc.tzinfo is None:
+                kickoff_utc = kickoff_utc.replace(tzinfo=timezone.utc)
+            return kickoff_utc
+        return None
+
+    def _needs_active_polling(self, all_fixtures: list) -> bool:
+        """True if there's a live match, or any match kicking off within
+        ACTIVE_WINDOW_MINUTES (plus a small grace period for one that just
+        kicked off) -- i.e. whether the poller should be doing full
+        per-match processing right now instead of idling. This is a plain
+        Mongo-data check (no 365Scores calls), so it's cheap to run every
+        idle recheck."""
+        if not all_fixtures:
+            return False
+
+        now = datetime.now(timezone.utc)
+
+        for match in all_fixtures:
+            if match.get("status") == "live":
+                return True
+
+            kickoff_utc = self._parse_kickoff_utc(match)
+            if kickoff_utc is None:
+                # Unknown kickoff time -- err toward polling it rather
+                # than silently idling on a fixture we can't reason about.
+                return True
+
+            minutes_to_kickoff = (kickoff_utc - now).total_seconds() / 60
+            if (
+                -self.ACTIVE_WINDOW_GRACE_MINUTES
+                <= minutes_to_kickoff
+                <= self.ACTIVE_WINDOW_MINUTES
+            ):
+                return True
+
+        return False
 
     def _maybe_scheduled_rescrape(self):
         """Backstop rescrape, independent of match completion. Runs at most
@@ -302,10 +386,11 @@ class Poller:
             self.last_scheduled_scrape = now
             self._trigger_rescrape(reason="scheduled twice-daily backstop")
 
-    def poll_once(self):
-        self._maybe_scheduled_rescrape()
+    def poll_once(self, all_fixtures: Optional[list] = None):
+        if all_fixtures is None:
+            self._maybe_scheduled_rescrape()
+            all_fixtures = self.store.get_all_fixtures()
 
-        all_fixtures = self.store.get_all_fixtures()
         if not all_fixtures:
             logger.debug("No fixtures found")
             return
