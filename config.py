@@ -60,6 +60,12 @@ SCRAPE_WINDOW_DAYS = 10
 # normal window.
 SCRAPE_WINDOW_DAYS_FALLBACK = 16
 
+# If SCRAPE_WINDOW_DAYS_FALLBACK also comes up empty, widen once more to
+# this many days (again, same fetched list, no extra API call). Covers
+# longer gaps -- e.g. a full international break -- that fall just past
+# the first fallback.
+SCRAPE_WINDOW_DAYS_FALLBACK_2 = 21
+
 # ============================================================
 # LEAGUE-BASED FIXTURES (leagues_scraper.py)
 # ============================================================

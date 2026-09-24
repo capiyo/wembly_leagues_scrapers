@@ -489,13 +489,19 @@ def scrape_league_fixtures_window(
 
     if not in_window:
         # Nothing landed in the normal window -- before giving up, retry
-        # with the wider fallback window (config.SCRAPE_WINDOW_DAYS_FALLBACK,
-        # 16 days by default). This re-filters the same already-fetched
-        # `games` list with a later cutoff, so it's free API-call-wise; it
-        # just covers gaps (international breaks, mid-season pauses) that
-        # are longer than the normal rolling window.
-        fallback_days = config.SCRAPE_WINDOW_DAYS_FALLBACK
-        if fallback_days > days_ahead:
+        # with progressively wider fallback windows (config.
+        # SCRAPE_WINDOW_DAYS_FALLBACK, then SCRAPE_WINDOW_DAYS_FALLBACK_2 --
+        # 16 then 21 days by default). Each retry re-filters the same
+        # already-fetched `games` list with a later cutoff, so it's free
+        # API-call-wise; it just covers gaps (international breaks,
+        # mid-season pauses) that are longer than the normal rolling
+        # window.
+        for fallback_days in (
+            config.SCRAPE_WINDOW_DAYS_FALLBACK,
+            config.SCRAPE_WINDOW_DAYS_FALLBACK_2,
+        ):
+            if fallback_days <= days_ahead:
+                continue
             logger.info(
                 "%s: no non-qualifier fixtures within the %d-day window from %s -- "
                 "retrying with the %d-day fallback window.",
@@ -508,6 +514,8 @@ def scrape_league_fixtures_window(
                 games, league_cfg, reference, fallback_days
             )
             days_ahead = fallback_days
+            if in_window:
+                break
 
         if not in_window:
             logger.info(
