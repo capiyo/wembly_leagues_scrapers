@@ -152,6 +152,19 @@ class FixtureStore:
             # they're Python-side only, not part of the Rust contract.
             "home_competitor_id": home_competitor_id,
             "away_competitor_id": away_competitor_id,
+            # Public fixture fields consumed by Funspot's shared UI.
+            "homeCompetitorId": int(home_competitor_id) if home_competitor_id is not None else None,
+            "awayCompetitorId": int(away_competitor_id) if away_competitor_id is not None else None,
+            "homeTeamImageUrl": (
+                f"https://imagecache.365scores.com/image/upload/f_png,w_96,h_96,c_limit,q_auto:eco,dpr_2/Competitors/{int(home_competitor_id)}"
+                if home_competitor_id is not None and str(home_competitor_id).isdigit() and int(home_competitor_id) > 0
+                else None
+            ),
+            "awayTeamImageUrl": (
+                f"https://imagecache.365scores.com/image/upload/f_png,w_96,h_96,c_limit,q_auto:eco,dpr_2/Competitors/{int(away_competitor_id)}"
+                if away_competitor_id is not None and str(away_competitor_id).isdigit() and int(away_competitor_id) > 0
+                else None
+            ),
             "competition_id": competition_id,
             "league": competition_name,
             # New for the multi-league scraper (leagues_scraper.py). None
