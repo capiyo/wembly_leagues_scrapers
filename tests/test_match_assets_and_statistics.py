@@ -38,7 +38,7 @@ class MatchAssetsAndStatisticsTests(unittest.TestCase):
         self.assertEqual(result["home"]["possession"], 56)
         self.assertEqual(result["away"]["possession"], 44)
         self.assertEqual(result["home"]["shots"], 12)
-        self.assertEqual(result["away"]["shotsOnTarget"], 2)
+        self.assertEqual(result["away"]["shots_on_target"], 2)
 
     def test_missing_statistics_are_not_fabricated_as_zero(self):
         game = {
