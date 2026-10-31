@@ -84,6 +84,7 @@ class MatchStateMachine:
         self.forwarder = forwarder
         self.lineups_fetched = set()
         self.stats_started = set()
+        self.last_statistics_fetch: Dict[str, datetime] = {}
         self.completed_notified = set()
         self.settlement_retries = {}  # match_id -> attempt_count
         self.max_settlement_retries = 3
@@ -204,12 +205,20 @@ class MatchStateMachine:
         return False
 
     def should_forward_statistics(self, match_id: str, phase: Optional[str]) -> bool:
-        if phase not in ("halftime", "stopped", "fulltime"):
+        if phase not in ("live", "halftime", "stopped", "fulltime"):
             return False
-        return (match_id, phase) not in self.stats_started
+        if phase in ("halftime", "stopped", "fulltime") and (match_id, phase) not in self.stats_started:
+            return True
+        last_fetched = self.last_statistics_fetch.get(match_id)
+        return (
+            last_fetched is None
+            or (datetime.now(timezone.utc) - last_fetched).total_seconds() >= 30
+        )
 
     def mark_stats_forwarded(self, match_id: str, phase: str):
-        self.stats_started.add((match_id, phase))
+        self.last_statistics_fetch[match_id] = datetime.now(timezone.utc)
+        if phase in ("halftime", "stopped", "fulltime"):
+            self.stats_started.add((match_id, phase))
 
     def should_finalize_result(self, match: Dict[str, Any]) -> bool:
         match_id = match.get("matchId")
@@ -1154,12 +1163,13 @@ class Poller:
 
         phase = threesixtyfive.classify_match_phase(status_text)
 
-        if self.state_machine.should_forward_statistics(match_id, phase):
+        statistics_phase = phase or ("live" if status_group == STATUS_GROUP_LIVE else None)
+        if self.state_machine.should_forward_statistics(match_id, statistics_phase):
             logger.info(
-                f"📊 {match_id}: phase={phase} ({status_text!r}) - fetching statistics"
+                f"📊 {match_id}: phase={statistics_phase} ({status_text!r}) - fetching statistics"
             )
             self._fetch_and_forward_statistics(match, game=game)
-            self.state_machine.mark_stats_forwarded(match_id, phase)
+            self.state_machine.mark_stats_forwarded(match_id, statistics_phase)
 
         # ─── MATCH END DETECTION ──────────────────────────────────────────────
         if phase == "fulltime" or status_group == STATUS_GROUP_FINISHED:
