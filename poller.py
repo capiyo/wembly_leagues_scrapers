@@ -1134,6 +1134,7 @@ class Poller:
         status_text = game.get("statusText", "")
         home_comp = game.get("homeCompetitor", {})
         away_comp = game.get("awayCompetitor", {})
+        self._forward_live_player_ratings(match, game)
         home_score = home_comp.get("score")
         away_score = away_comp.get("score")
 
