@@ -461,13 +461,15 @@ def _parse_stat_value(value: Any) -> Optional[float]:
     if isinstance(value, bool) or value is None:
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        numeric = float(value)
+        return int(numeric) if numeric.is_integer() else numeric
     raw = str(value).strip().replace("%", "").replace(",", ".")
     match = re.search(r"-?\d+(?:\.\d+)?", raw)
     if not match:
         return None
     try:
-        return float(match.group(0))
+        numeric = float(match.group(0))
+        return int(numeric) if numeric.is_integer() else numeric
     except ValueError:
         return None
 
