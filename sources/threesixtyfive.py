@@ -332,6 +332,12 @@ def fetch_lineups(
                 player["shortName"] = info.get("shortName")
                 player["athleteId"] = info.get("athleteId")
                 player["jerseyNumber"] = info.get("jerseyNumber")
+                player["imageUrl"] = build_athlete_image_url(
+                    info.get("athleteId"), info.get("imageVersion")
+                )
+                ranking = player.get("ranking")
+                if isinstance(ranking, (int, float)) and not isinstance(ranking, bool):
+                    player["rating"] = float(ranking)
         return lineup
 
     home_lineups = _attach_names(home_lineups)
@@ -394,90 +400,189 @@ def classify_match_phase(status_text: Optional[str]) -> Optional[str]:
     return None
 
 
-# Set to True the first time extract_statistics_from_game() logs its
-# "not implemented" error, so the poller's logs get one loud warning per
-# process instead of one per snapshot (every halftime/stopped/fulltime
-# transition, for every live match). The underlying problem never
-# changes call to call, so repeating the same error every ~15s adds
-# noise without adding information.
-_STATS_UNIMPLEMENTED_WARNED = False
+def build_competitor_image_url(competitor_id: Any, image_version: Any = 1) -> Optional[str]:
+    """Build the official 365Scores CDN URL for a club/national-team crest."""
+    if competitor_id is None:
+        return None
+    try:
+        version = max(1, int(image_version or 1))
+        entity_id = int(competitor_id)
+    except (TypeError, ValueError):
+        return None
+    return (
+        "https://imagecache.365scores.com/image/upload/"
+        "f_png,w_96,h_96,c_limit,q_auto:eco,dpr_2,"
+        "d_Competitors:default1.png/"
+        f"v{version}/Competitors/{entity_id}"
+    )
 
 
-def extract_statistics_from_game(game: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def build_athlete_image_url(athlete_id: Any, image_version: Any = 1) -> Optional[str]:
+    """Build the official 365Scores CDN URL for a player's portrait."""
+    if athlete_id is None:
+        return None
+    try:
+        version = max(1, int(image_version or 1))
+        entity_id = int(athlete_id)
+    except (TypeError, ValueError):
+        return None
+    return (
+        "https://imagecache.365scores.com/image/upload/"
+        "f_png,w_96,h_96,c_limit,q_auto:eco,dpr_2,"
+        "d_Athletes:default.png,r_max,c_thumb,g_face,z_0.65/"
+        f"v{version}/Athletes/{entity_id}"
+    )
+
+
+def _normalise_stat_name(name: Any) -> str:
+    text = re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).strip()
+    aliases = {
+        "ball possession": "possession",
+        "possession": "possession",
+        "total shots": "shots",
+        "shots": "shots",
+        "shots on target": "shots_on_target",
+        "shots on goal": "shots_on_target",
+        "shots off target": "shots_off_target",
+        "shots off goal": "shots_off_target",
+        "corner kicks": "corners",
+        "corners": "corners",
+        "fouls": "fouls",
+        "yellow cards": "yellow_cards",
+        "red cards": "red_cards",
+        "offsides": "offsides",
+        "passes": "passes",
+        "pass accuracy": "pass_accuracy",
+    }
+    return aliases.get(text, "")
+
+
+def _parse_stat_value(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    raw = str(value).strip().replace("%", "").replace(",", ".")
+    match = re.search(r"-?\d+(?:\.\d+)?", raw)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def _statistics_rows(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Flatten the documented 365Scores statistics rows without guessing values."""
+    rows: List[Dict[str, Any]] = []
+    raw_statistics = payload.get("statistics")
+    if isinstance(raw_statistics, list):
+        for item in raw_statistics:
+            if not isinstance(item, dict):
+                continue
+            if "competitorId" in item and ("value" in item or "stats" in item):
+                rows.append(item)
+                continue
+            for row in item.get("rows", []) if isinstance(item.get("rows"), list) else []:
+                if not isinstance(row, dict):
+                    continue
+                entity = row.get("entity") or {}
+                values = row.get("stats") or []
+                if isinstance(values, dict):
+                    values = [values]
+                for stat in values:
+                    if isinstance(stat, dict):
+                        rows.append({
+                            **stat,
+                            "competitorId": entity.get("id") or row.get("competitorId"),
+                            "name": item.get("name") or stat.get("name"),
+                        })
+    return rows
+
+
+def extract_statistics_from_game(
+    game: Dict[str, Any],
+    statistics_payload: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Map the real /web/game/stats/ response to the Rust team-statistics contract.
+
+    365Scores keeps match statistics on its dedicated game/stats endpoint,
+    not on /web/game/. Missing values stay None; they are never coerced to 0.
     """
-    Build the statistics payload from an already-fetched `game` object.
+    if not isinstance(statistics_payload, dict):
+        return None
 
-    STATUS: NOT IMPLEMENTED. The home*/away* fields this used to read
-    (homePossession, homeShots, homeCorners, homeFouls, homeYellowCards,
-    homeRedCards, homeOffsides, homePasses, homePassAccuracy, and the
-    away* equivalents) do not exist anywhere on the `game` object --
-    verified against the repo's committed sample response,
-    game_4627864.json. Real statistics for a match with hasStats: True
-    are served through one of the URLs in game["widgets"] (SportRadar-
-    hosted, e.g. an LMT/Momentum widget), the same way commentary lives
-    behind playByPlay.feedURL instead of directly on /web/game/. Nobody
-    has captured a raw response from one of those widget URLs yet, so
-    there is no confirmed field shape to parse.
+    home_id = (game.get("homeCompetitor") or {}).get("id")
+    away_id = (game.get("awayCompetitor") or {}).get("id")
+    if home_id is None or away_id is None:
+        return None
 
-    Returns None unconditionally right now, on purpose -- NOT a dict of
-    Nones. Returning a fully-populated-looking dict where every value
-    happens to be None is exactly how the original bug went undetected:
-    it stores and forwards indistinguishably from "this match really has
-    no stats", and both poller.py and downstream storage treat it as a
-    successful snapshot. Callers (see fetch_statistics() and
-    fetch_complete_match_data() below) must treat this None the same way
-    fetch_lineups() treats an unpublished lineup: "nothing to store".
+    result: Dict[str, Dict[str, Optional[float]]] = {
+        "home": {},
+        "away": {},
+    }
+    id_to_side = {str(home_id): "home", str(away_id): "away"}
 
-    To implement this for real:
-      1. Capture one raw response body from a widgetUrl in
-         game["widgets"] for a live match (e.g. the SportRadarLMT_V3
-         entry) and inspect its actual field names.
-      2. Replace this function's body with a parser for that confirmed
-         shape.
-      3. Remove the _STATS_UNIMPLEMENTED_WARNED short-circuit below.
-    """
-    global _STATS_UNIMPLEMENTED_WARNED
-    if not _STATS_UNIMPLEMENTED_WARNED:
-        logger.error(
-            "extract_statistics_from_game() is not implemented: the "
-            "home*/away* stat fields it used to read do not exist on the "
-            "/web/game/ response (confirmed against game_4627864.json). "
-            "Real stats live behind one of game['widgets'] (SportRadar-"
-            "hosted), which has not been captured/parsed yet. Returning "
-            "None instead of a dict of Nones so this stops being stored "
-            "as a fake zero-value statistics snapshot. See this "
-            "function's docstring for what's needed to implement it."
-        )
-        _STATS_UNIMPLEMENTED_WARNED = True
-    else:
-        logger.debug(
-            "extract_statistics_from_game() called again -- still not "
-            "implemented, returning None (see earlier error log)."
-        )
-    return None
+    for row in _statistics_rows(statistics_payload):
+        side = id_to_side.get(str(row.get("competitorId")))
+        stat_key = _normalise_stat_name(row.get("name") or row.get("statName"))
+        value = _parse_stat_value(row.get("value"))
+        if not side or not stat_key or value is None:
+            continue
+        result[side][stat_key] = value
+
+    if not result["home"] and not result["away"]:
+        logger.debug("365Scores has not published usable statistics for game %s", game.get("id"))
+        return None
+
+    actual = statistics_payload.get("actualGameStatistics") or {}
+    minute_raw = game.get("gameTime") or actual.get("gameTime") or 0
+    try:
+        minute = int(float(minute_raw))
+    except (TypeError, ValueError):
+        minute = 0
+
+    return {
+        "minute": minute,
+        "home": result["home"],
+        "away": result["away"],
+    }
 
 
 def fetch_statistics(
-    game_id: str, away_id: int, home_id: int, competition_id: int
+    game_id: str,
+    away_id: int,
+    home_id: int,
+    competition_id: int,
+    game: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Fetch statistics from the game details endpoint.
-
-    NOTE: this makes its own fetch_game_details() call. If you already
-    have a `game` object on hand, prefer extract_statistics_from_game(game)
-    to avoid a redundant network request.
-
-    Returns None -- see extract_statistics_from_game()'s docstring.
-    Statistics extraction is not implemented; the guessed home*/away*
-    fields it used to read don't exist on this endpoint's response.
-    """
-    data = fetch_game_details(game_id, away_id, home_id, competition_id)
-
-    if not data or "game" not in data:
+    """Fetch the dedicated 365Scores match-statistics endpoint."""
+    params = {
+        "appTypeId": 5,
+        "langId": 1,
+        "timezoneName": "Africa/Nairobi",
+        "userCountryId": 413,
+        "games": str(game_id),
+    }
+    url = f"{BASE_URL}/web/game/stats/"
+    try:
+        response = requests.get(url, headers=DEFAULT_HEADERS, params=params, timeout=30)
+        response.raise_for_status()
+        payload = response.json()
+    except requests.exceptions.RequestException as exc:
+        logger.warning("Failed to fetch match statistics for %s: %s", game_id, exc)
+        return None
+    except ValueError as exc:
+        logger.warning("Invalid match statistics JSON for %s: %s", game_id, exc)
         return None
 
-    game = data.get("game", {})
-    return extract_statistics_from_game(game)
+    game_data = game or {}
+    if not game_data:
+        details = fetch_game_details(game_id, away_id, home_id, competition_id)
+        game_data = (details or {}).get("game") or {}
+    if not game_data:
+        return None
+    return extract_statistics_from_game(game_data, payload)
 
 
 # ============================================================================
