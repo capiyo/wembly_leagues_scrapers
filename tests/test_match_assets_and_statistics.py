@@ -1,5 +1,7 @@
 import unittest
+from datetime import datetime, timedelta, timezone
 
+from poller import MatchStateMachine
 from sources.threesixtyfive import (
     build_athlete_image_url,
     build_competitor_image_url,
@@ -47,6 +49,15 @@ class MatchAssetsAndStatisticsTests(unittest.TestCase):
             "awayCompetitor": {"id": 5028},
         }
         self.assertIsNone(extract_statistics_from_game(game, {"statistics": []}))
+
+    def test_live_statistics_refresh_every_thirty_seconds(self):
+        state = MatchStateMachine(store=object(), forwarder=object())
+        self.assertTrue(state.should_forward_statistics("fixture-1", "live"))
+        state.mark_stats_forwarded("fixture-1", "live")
+        self.assertFalse(state.should_forward_statistics("fixture-1", "live"))
+        state.last_statistics_fetch["fixture-1"] = datetime.now(timezone.utc) - timedelta(seconds=31)
+        self.assertTrue(state.should_forward_statistics("fixture-1", "live"))
+        self.assertTrue(state.should_forward_statistics("fixture-1", "halftime"))
 
 
 if __name__ == "__main__":
