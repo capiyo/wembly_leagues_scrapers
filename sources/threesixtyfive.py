@@ -332,6 +332,14 @@ def fetch_lineups(
                 player["shortName"] = info.get("shortName")
                 player["athleteId"] = info.get("athleteId")
                 player["jerseyNumber"] = info.get("jerseyNumber")
+                athlete_id = info.get("athleteId")
+                if athlete_id is not None and str(athlete_id).isdigit() and int(athlete_id) > 0:
+                    player["photoUrl"] = (
+                        "https://imagecache.365scores.com/image/upload/"
+                        "f_png,w_160,h_160,c_limit,q_auto:eco,dpr_2,"
+                        "d_Athletes:default.png,r_max,c_thumb,g_face,z_0.65/"
+                        f"Athletes/{int(athlete_id)}"
+                    )
         return lineup
 
     home_lineups = _attach_names(home_lineups)
