@@ -100,6 +100,8 @@ class FixtureStore:
         round_name: Optional[str] = None,
         group_num: Optional[int] = None,
         group_name: Optional[str] = None,
+        home_team_image_url: Optional[str] = None,
+        away_team_image_url: Optional[str] = None,
     ) -> bool:
         """
         Upsert a fixture. Document keys match Rust's Game struct exactly
@@ -147,6 +149,8 @@ class FixtureStore:
             "threesixtyfiveGameId": threesixtyfive_game_id,
             "homeTeam": home_team,
             "awayTeam": away_team,
+            "homeTeamImageUrl": home_team_image_url,
+            "awayTeamImageUrl": away_team_image_url,
             # Bookkeeping fields, not on the Rust struct -- harmless extras,
             # ignored by serde on read. Kept snake_case to make clear
             # they're Python-side only, not part of the Rust contract.
