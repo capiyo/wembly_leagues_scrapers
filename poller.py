@@ -276,6 +276,7 @@ class Poller:
         self.store = store
         self.forwarder = forwarder
         self.state_machine = MatchStateMachine(store, forwarder)
+        self.player_rating_signatures: Dict[str, Tuple[Tuple[str, float], ...]] = {}
         self.running = False
         self.poll_count = 0
         # Seeded to "already due" so the very first poll cycle after startup
@@ -725,6 +726,8 @@ class Poller:
             "captain": False,
             "lineup": lineup_slot,
             "playerId": str(player_id) if player_id is not None else None,
+            "rating": member.get("rating") if isinstance(member.get("rating"), (int, float)) else None,
+            "imageUrl": member.get("imageUrl"),
         }
 
     def _team_lineup_for_forwarder(self, team_lineup: Dict[str, Any]) -> Dict[str, Any]:
@@ -876,7 +879,13 @@ class Poller:
         competition_id = match.get("competition_id", 5930)
 
         if game is not None:
-            stats = threesixtyfive.extract_statistics_from_game(game)
+            stats = threesixtyfive.fetch_statistics(
+                game_id=game_id,
+                away_id=away_id,
+                home_id=home_id,
+                competition_id=competition_id,
+                game=game,
+            )
         else:
             if not all([game_id, away_id, home_id]):
                 return
@@ -905,6 +914,7 @@ class Poller:
         match_id = match.get("matchId")
         home_comp = game.get("homeCompetitor", {})
         away_comp = game.get("awayCompetitor", {})
+        self._forward_live_player_ratings(match, game)
         home_score = home_comp.get("score")
         away_score = away_comp.get("score")
 
@@ -1028,6 +1038,67 @@ class Poller:
             logger.warning(
                 f"⚠️ Failed to settle {market_id} for {match_id}, will retry next poll"
             )
+
+    def _forward_live_player_ratings(self, match: Dict[str, Any], game: Dict[str, Any]) -> None:
+        """Forward changed 365Scores player ratings without reposting lineups every poll."""
+        match_id = match.get("matchId")
+        home_comp = game.get("homeCompetitor") or {}
+        away_comp = game.get("awayCompetitor") or {}
+        home_lineup = home_comp.get("lineups") or {}
+        away_lineup = away_comp.get("lineups") or {}
+        home_members = home_lineup.get("members") or []
+        away_members = away_lineup.get("members") or []
+        if not home_members and not away_members:
+            return
+
+        roster = {
+            member.get("id"): member
+            for member in (game.get("members") or [])
+            if isinstance(member, dict) and member.get("id") is not None
+        }
+
+        def enrich(lineup: Dict[str, Any]) -> Dict[str, Any]:
+            result = dict(lineup)
+            members = []
+            for raw in lineup.get("members") or []:
+                member = dict(raw)
+                info = roster.get(member.get("id")) or {}
+                member["name"] = info.get("name") or info.get("shortName") or member.get("name")
+                member["shortName"] = info.get("shortName") or member.get("shortName")
+                member["athleteId"] = info.get("athleteId") or member.get("athleteId")
+                member["jerseyNumber"] = info.get("jerseyNumber") or member.get("jerseyNumber")
+                member["imageUrl"] = threesixtyfive.build_athlete_image_url(
+                    member.get("athleteId"), info.get("imageVersion")
+                )
+                rating = member.get("ranking")
+                if isinstance(rating, (int, float)) and not isinstance(rating, bool):
+                    member["rating"] = float(rating)
+                members.append(member)
+            result["members"] = members
+            return result
+
+        home = enrich(home_lineup)
+        away = enrich(away_lineup)
+        shaped_home = self._team_lineup_for_forwarder(home)
+        shaped_away = self._team_lineup_for_forwarder(away)
+        all_players = shaped_home["players"] + shaped_home["bench"] + shaped_away["players"] + shaped_away["bench"]
+        rated_players = tuple(sorted(
+            (str(player["playerId"]), float(player["rating"]))
+            for player in all_players
+            if player.get("playerId") is not None and isinstance(player.get("rating"), (int, float))
+        ))
+        if not rated_players or self.player_rating_signatures.get(match_id) == rated_players:
+            return
+
+        payload = {
+            "fixtureId": match_id,
+            "homeTeam": match.get("homeTeam", home_comp.get("name", "Unknown")),
+            "awayTeam": match.get("awayTeam", away_comp.get("name", "Unknown")),
+            "lineups": {"home": shaped_home, "away": shaped_away},
+        }
+        if self.forwarder.forward_lineups(payload):
+            self.player_rating_signatures[match_id] = rated_players
+            logger.info("⭐ Updated %d player ratings for %s", len(rated_players), match_id)
 
     def _fetch_live_updates(self, match: Dict[str, Any]):
         match_id = match.get("matchId")
