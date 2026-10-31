@@ -84,6 +84,7 @@ class MatchStateMachine:
         self.forwarder = forwarder
         self.lineups_fetched = set()
         self.stats_started = set()
+        self.last_statistics_fetch: Dict[str, datetime] = {}
         self.completed_notified = set()
         self.settlement_retries = {}  # match_id -> attempt_count
         self.max_settlement_retries = 3
@@ -204,12 +205,20 @@ class MatchStateMachine:
         return False
 
     def should_forward_statistics(self, match_id: str, phase: Optional[str]) -> bool:
-        if phase not in ("halftime", "stopped", "fulltime"):
+        if phase not in ("live", "halftime", "stopped", "fulltime"):
             return False
-        return (match_id, phase) not in self.stats_started
+        if phase in ("halftime", "stopped", "fulltime") and (match_id, phase) not in self.stats_started:
+            return True
+        last_fetched = self.last_statistics_fetch.get(match_id)
+        return (
+            last_fetched is None
+            or (datetime.now(timezone.utc) - last_fetched).total_seconds() >= 30
+        )
 
     def mark_stats_forwarded(self, match_id: str, phase: str):
-        self.stats_started.add((match_id, phase))
+        self.last_statistics_fetch[match_id] = datetime.now(timezone.utc)
+        if phase in ("halftime", "stopped", "fulltime"):
+            self.stats_started.add((match_id, phase))
 
     def should_finalize_result(self, match: Dict[str, Any]) -> bool:
         match_id = match.get("matchId")
@@ -276,6 +285,7 @@ class Poller:
         self.store = store
         self.forwarder = forwarder
         self.state_machine = MatchStateMachine(store, forwarder)
+        self.player_rating_signatures: Dict[str, Tuple[Tuple[str, float], ...]] = {}
         self.running = False
         self.poll_count = 0
         # Seeded to "already due" so the very first poll cycle after startup
@@ -725,6 +735,8 @@ class Poller:
             "captain": False,
             "lineup": lineup_slot,
             "playerId": str(player_id) if player_id is not None else None,
+            "rating": member.get("rating") if isinstance(member.get("rating"), (int, float)) else None,
+            "imageUrl": member.get("imageUrl"),
         }
 
     def _team_lineup_for_forwarder(self, team_lineup: Dict[str, Any]) -> Dict[str, Any]:
@@ -876,7 +888,13 @@ class Poller:
         competition_id = match.get("competition_id", 5930)
 
         if game is not None:
-            stats = threesixtyfive.extract_statistics_from_game(game)
+            stats = threesixtyfive.fetch_statistics(
+                game_id=game_id,
+                away_id=away_id,
+                home_id=home_id,
+                competition_id=competition_id,
+                game=game,
+            )
         else:
             if not all([game_id, away_id, home_id]):
                 return
@@ -905,6 +923,7 @@ class Poller:
         match_id = match.get("matchId")
         home_comp = game.get("homeCompetitor", {})
         away_comp = game.get("awayCompetitor", {})
+        self._forward_live_player_ratings(match, game)
         home_score = home_comp.get("score")
         away_score = away_comp.get("score")
 
@@ -1029,6 +1048,67 @@ class Poller:
                 f"⚠️ Failed to settle {market_id} for {match_id}, will retry next poll"
             )
 
+    def _forward_live_player_ratings(self, match: Dict[str, Any], game: Dict[str, Any]) -> None:
+        """Forward changed 365Scores player ratings without reposting lineups every poll."""
+        match_id = match.get("matchId")
+        home_comp = game.get("homeCompetitor") or {}
+        away_comp = game.get("awayCompetitor") or {}
+        home_lineup = home_comp.get("lineups") or {}
+        away_lineup = away_comp.get("lineups") or {}
+        home_members = home_lineup.get("members") or []
+        away_members = away_lineup.get("members") or []
+        if not home_members and not away_members:
+            return
+
+        roster = {
+            member.get("id"): member
+            for member in (game.get("members") or [])
+            if isinstance(member, dict) and member.get("id") is not None
+        }
+
+        def enrich(lineup: Dict[str, Any]) -> Dict[str, Any]:
+            result = dict(lineup)
+            members = []
+            for raw in lineup.get("members") or []:
+                member = dict(raw)
+                info = roster.get(member.get("id")) or {}
+                member["name"] = info.get("name") or info.get("shortName") or member.get("name")
+                member["shortName"] = info.get("shortName") or member.get("shortName")
+                member["athleteId"] = info.get("athleteId") or member.get("athleteId")
+                member["jerseyNumber"] = info.get("jerseyNumber") or member.get("jerseyNumber")
+                member["imageUrl"] = threesixtyfive.build_athlete_image_url(
+                    member.get("athleteId"), info.get("imageVersion")
+                )
+                rating = member.get("ranking")
+                if isinstance(rating, (int, float)) and not isinstance(rating, bool):
+                    member["rating"] = float(rating)
+                members.append(member)
+            result["members"] = members
+            return result
+
+        home = enrich(home_lineup)
+        away = enrich(away_lineup)
+        shaped_home = self._team_lineup_for_forwarder(home)
+        shaped_away = self._team_lineup_for_forwarder(away)
+        all_players = shaped_home["players"] + shaped_home["bench"] + shaped_away["players"] + shaped_away["bench"]
+        rated_players = tuple(sorted(
+            (str(player["playerId"]), float(player["rating"]))
+            for player in all_players
+            if player.get("playerId") is not None and isinstance(player.get("rating"), (int, float))
+        ))
+        if not rated_players or self.player_rating_signatures.get(match_id) == rated_players:
+            return
+
+        payload = {
+            "fixtureId": match_id,
+            "homeTeam": match.get("homeTeam", home_comp.get("name", "Unknown")),
+            "awayTeam": match.get("awayTeam", away_comp.get("name", "Unknown")),
+            "lineups": {"home": shaped_home, "away": shaped_away},
+        }
+        if self.forwarder.forward_lineups(payload):
+            self.player_rating_signatures[match_id] = rated_players
+            logger.info("⭐ Updated %d player ratings for %s", len(rated_players), match_id)
+
     def _fetch_live_updates(self, match: Dict[str, Any]):
         match_id = match.get("matchId")
         game_id = match.get("threesixtyfiveGameId")
@@ -1054,6 +1134,7 @@ class Poller:
         status_text = game.get("statusText", "")
         home_comp = game.get("homeCompetitor", {})
         away_comp = game.get("awayCompetitor", {})
+        self._forward_live_player_ratings(match, game)
         home_score = home_comp.get("score")
         away_score = away_comp.get("score")
 
@@ -1083,12 +1164,13 @@ class Poller:
 
         phase = threesixtyfive.classify_match_phase(status_text)
 
-        if self.state_machine.should_forward_statistics(match_id, phase):
+        statistics_phase = phase or ("live" if status_group == STATUS_GROUP_LIVE else None)
+        if self.state_machine.should_forward_statistics(match_id, statistics_phase):
             logger.info(
-                f"📊 {match_id}: phase={phase} ({status_text!r}) - fetching statistics"
+                f"📊 {match_id}: phase={statistics_phase} ({status_text!r}) - fetching statistics"
             )
             self._fetch_and_forward_statistics(match, game=game)
-            self.state_machine.mark_stats_forwarded(match_id, phase)
+            self.state_machine.mark_stats_forwarded(match_id, statistics_phase)
 
         # ─── MATCH END DETECTION ──────────────────────────────────────────────
         if phase == "fulltime" or status_group == STATUS_GROUP_FINISHED:

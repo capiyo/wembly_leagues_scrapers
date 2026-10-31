@@ -143,8 +143,10 @@ def _upsert_games(
         game_id = str(game.get("id"))
         home_team = (game.get("homeCompetitor") or {}).get("name", "Unknown")
         away_team = (game.get("awayCompetitor") or {}).get("name", "Unknown")
-        home_competitor_id = (game.get("homeCompetitor") or {}).get("id")
-        away_competitor_id = (game.get("awayCompetitor") or {}).get("id")
+        home_competitor = game.get("homeCompetitor") or {}
+        away_competitor = game.get("awayCompetitor") or {}
+        home_competitor_id = home_competitor.get("id")
+        away_competitor_id = away_competitor.get("id")
         competition_id = game.get("competitionId")
         comp_name = game.get("competitionDisplayName") or league_name
         kickoff = _parse_kickoff(game.get("startTime"))
@@ -168,6 +170,12 @@ def _upsert_games(
             round_name=game.get("roundName"),
             group_num=game.get("groupNum"),
             group_name=game.get("groupName"),
+            home_team_image_url=threesixtyfive.build_competitor_image_url(
+                home_competitor_id, home_competitor.get("imageVersion")
+            ),
+            away_team_image_url=threesixtyfive.build_competitor_image_url(
+                away_competitor_id, away_competitor.get("imageVersion")
+            ),
         )
         upserted += 1
         logger.info(
