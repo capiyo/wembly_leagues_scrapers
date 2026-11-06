@@ -115,11 +115,10 @@ class MatchStateMachine:
 
         status = match.get("status", "")
 
-        if status == "completed":
-            return "completed"
-
-        if minutes_until_kickoff <= 0:
-            return "live"
+        # Keep a source-confirmed live/completed state. Kickoff time alone
+        # must never promote a scheduled fixture to live.
+        if status in ("completed", "live"):
+            return status
 
         if minutes_until_kickoff <= SOON_THRESHOLD_MINUTES:
             return "soon"
@@ -127,48 +126,30 @@ class MatchStateMachine:
         return "upcoming"
 
     def should_update_status(self, match: Dict[str, Any]) -> Optional[str]:
-        """Determine if status should be updated. Smart correction included."""
+        """Apply schedule states; LIVE is set only after 365Scores confirms play."""
         current_status = match.get("status", "upcoming")
         minutes_to_kickoff = match.get("minutes_to_kickoff")
         state = match.get("_state")
 
-        if current_status == "completed":
+        if current_status in ("completed", "live"):
             return None
 
-        if state == "live" and current_status != "live":
-            if minutes_to_kickoff is not None and minutes_to_kickoff <= 0:
-                logger.info(f"⏰ Forcing 'live': state=live, status={current_status}")
-                return "live"
-
-        if state == "soon" and current_status == "live":
-            if minutes_to_kickoff is not None and minutes_to_kickoff > 0:
-                logger.info(
-                    f"🔄 Correcting 'live' → 'soon' ({minutes_to_kickoff:.0f} mins to kickoff)"
-                )
-                return "soon"
-
-        if state == "upcoming" and current_status in ("soon", "live"):
+        if state == "upcoming" and current_status == "soon":
             if (
                 minutes_to_kickoff is not None
                 and minutes_to_kickoff > SOON_THRESHOLD_MINUTES
             ):
                 logger.info(
-                    f"🔄 Correcting '{current_status}' → 'upcoming' ({minutes_to_kickoff:.0f} mins to kickoff)"
+                    "🔄 Correcting 'soon' → 'upcoming' "
+                    f"({minutes_to_kickoff:.0f} mins to kickoff)"
                 )
                 return "upcoming"
 
-        if (
-            minutes_to_kickoff is not None
-            and minutes_to_kickoff <= 0
-            and current_status != "live"
-        ):
-            return "live"
-
-        if (
-            minutes_to_kickoff is not None
-            and minutes_to_kickoff <= SOON_THRESHOLD_MINUTES
-            and current_status == "upcoming"
-        ):
+        if state == "soon" and current_status == "upcoming":
+            logger.info(
+                "⏳ Moving 'upcoming' → 'soon' "
+                f"({minutes_to_kickoff:.0f} mins to kickoff)"
+            )
             return "soon"
 
         return None
@@ -276,6 +257,7 @@ class Poller:
         self.store = store
         self.forwarder = forwarder
         self.state_machine = MatchStateMachine(store, forwarder)
+        self._status_synced = set()
         self.running = False
         self.poll_count = 0
         # Seeded to "already due" so the very first poll cycle after startup
@@ -561,56 +543,47 @@ class Poller:
         new_status = self.state_machine.should_update_status(match)
 
         if new_status and new_status != current_status:
-            if new_status == "live":
-                if kickoff_passed:
-                    logger.info(
-                        f"⏰ {match_id}: Kickoff passed, transitioning to 'live'"
-                    )
-                else:
-                    is_actually_live, _ = self._verify_live_status_with_365scores(match)
-                    if (
-                        not is_actually_live
-                        and minutes_to_kickoff is not None
-                        and minutes_to_kickoff > 2
-                    ):
-                        logger.info(
-                            f"⏳ {match_id}: 365Scores says not live yet, delaying 'soon' → 'live' "
-                            f"({minutes_to_kickoff:.0f} mins to kickoff)"
-                        )
-                        new_status = None
-                    elif (
-                        not is_actually_live
-                        and minutes_to_kickoff is not None
-                        and minutes_to_kickoff <= 2
-                    ):
-                        logger.info(
-                            f"⏰ {match_id}: Near kickoff ({minutes_to_kickoff:.0f} mins) — "
-                            f"transitioning to 'live' even though 365Scores not updated yet"
-                        )
+            logger.info(f"📊 {match_id}: {current_status} → {new_status}")
+            self.store.update_status(match_id, new_status)
+            forwarded = self.forwarder.forward_live_update(
+                {
+                    "fixture_id": match_id,
+                    "event_type": "status_change",
+                    "status": new_status,
+                    "minute": int(match.get("timeElapsed") or 0),
+                    "is_live": False,
+                    "available_for_voting": new_status in ["upcoming", "soon"],
+                    "minutes_to_kickoff": minutes_to_kickoff,
+                }
+            )
+            if forwarded:
+                self._status_synced.add(match_id)
+            match["status"] = new_status
+            current_status = new_status
 
-            if new_status and new_status != current_status:
-                logger.info(f"📊 {match_id}: {current_status} → {new_status}")
-                self.store.update_status(match_id, new_status)
-                self.forwarder.forward_live_update(
-                    {
-                        "fixture_id": match_id,
-                        "event_type": "status_change",
-                        "status": new_status,
-                        "minute": int(match.get("timeElapsed") or 0),
-                        "is_live": new_status == "live",
-                        "available_for_voting": new_status in ["upcoming", "soon"],
-                        "minutes_to_kickoff": minutes_to_kickoff,
-                    }
-                )
-                match["status"] = new_status
-                current_status = new_status
+            if new_status == "completed":
+                self._finalize_match_result(match)
+                return
 
-                if new_status == "completed":
-                    self._finalize_match_result(match)
-                    return
-
-                if new_status == "live":
-                    self._notify_match_live(match)
+        # Reconcile once after poller startup. This repairs fixtures whose
+        # local state is already "soon" but whose API status was incorrectly
+        # promoted to "live" by an older backend handler.
+        if current_status == "soon" and match_id not in self._status_synced:
+            forwarded = self.forwarder.forward_live_update(
+                {
+                    "fixture_id": match_id,
+                    "event_type": "status_change",
+                    "status": "soon",
+                    "home_score": match.get("homeScore") or 0,
+                    "away_score": match.get("awayScore") or 0,
+                    "minute": int(match.get("timeElapsed") or 0),
+                    "is_live": False,
+                    "available_for_voting": True,
+                    "minutes_to_kickoff": minutes_to_kickoff,
+                }
+            )
+            if forwarded:
+                self._status_synced.add(match_id)
 
         if self.state_machine.should_fetch_lineups(
             match, current_status, minutes_to_kickoff
