@@ -479,7 +479,15 @@ class Poller:
                 "ht",
                 "live",
             )
-            if any(marker in status_text.lower() for marker in live_markers):
+            normalized_status_text = status_text.strip().lower()
+            finished_markers = ("full time", "finished", "ft", "after penalties")
+            if any(
+                marker == normalized_status_text
+                or marker in normalized_status_text
+                for marker in finished_markers
+            ):
+                return False, "finished"
+            if any(marker in normalized_status_text for marker in live_markers):
                 return True, status_text
             return False, status_text
 
@@ -575,6 +583,33 @@ class Poller:
             )
 
             if not is_actually_live:
+                verified_status = self.state_machine.resolve_verified_live_status(
+                    False, verify_status_text, minutes_to_kickoff
+                )
+                if verified_status == "completed":
+                    logger.info(
+                        f"🏁 {match_id}: 365Scores confirms the match is finished; "
+                        "correcting local status to completed"
+                    )
+                    self.store.update_status(match_id, "completed")
+                    forwarded = self.forwarder.forward_live_update(
+                        {
+                            "fixture_id": match_id,
+                            "event_type": "status_change",
+                            "status": "completed",
+                            "home_score": match.get("homeScore") or 0,
+                            "away_score": match.get("awayScore") or 0,
+                            "minute": int(match.get("timeElapsed") or 0),
+                            "is_live": False,
+                            "available_for_voting": False,
+                            "minutes_to_kickoff": minutes_to_kickoff,
+                        }
+                    )
+                    if forwarded:
+                        self._status_synced.add(match_id)
+                    match["status"] = "completed"
+                    self._finalize_match_result(match)
+                    return
                 logger.info(
                     f"⏳ {match_id}: Kickoff time passed ({minutes_to_kickoff:.0f} mins ago) "
                     f"but 365Scores doesn't show it as live yet ('{verify_status_text}') -- "
