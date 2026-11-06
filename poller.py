@@ -125,6 +125,26 @@ class MatchStateMachine:
 
         return "upcoming"
 
+    def resolve_verified_live_status(
+        self,
+        is_actually_live: bool,
+        provider_status: Optional[str],
+        minutes_to_kickoff: Optional[float],
+    ) -> Optional[str]:
+        """Reconcile a cached LIVE state against an explicit provider result."""
+        if is_actually_live:
+            return "live"
+        if provider_status == "finished":
+            return "completed"
+        if provider_status == "scheduled":
+            if (
+                minutes_to_kickoff is not None
+                and minutes_to_kickoff <= SOON_THRESHOLD_MINUTES
+            ):
+                return "soon"
+            return "upcoming"
+        return None
+
     def should_update_status(self, match: Dict[str, Any]) -> Optional[str]:
         """Apply schedule states; LIVE is set only after 365Scores confirms play."""
         current_status = match.get("status", "upcoming")
@@ -498,24 +518,23 @@ class Poller:
         current_status = match.get("status", "upcoming")
 
         # Repair stale false-LIVE records left by earlier kickoff-time
-        # heuristics. A known scheduled status from 365Scores demotes them
-        # back to SOON/UPCOMING; transient provider failures do not.
+        # heuristics. Explicit 365Scores scheduled/finished states correct
+        # the cache; transient provider failures never demote a live match.
+        live_status_checked = False
         if current_status == "live" and match_id not in self._live_status_verified:
             is_actually_live, verify_status_text = (
                 self._verify_live_status_with_365scores(match)
             )
+            live_status_checked = True
+            corrected_status = self.state_machine.resolve_verified_live_status(
+                is_actually_live, verify_status_text, minutes_to_kickoff
+            )
             if is_actually_live:
                 self._live_status_verified.add(match_id)
-            elif verify_status_text == "scheduled":
-                corrected_status = (
-                    "soon"
-                    if minutes_to_kickoff is not None
-                    and minutes_to_kickoff <= SOON_THRESHOLD_MINUTES
-                    else "upcoming"
-                )
+            elif corrected_status in ("soon", "upcoming", "completed"):
                 logger.warning(
                     f"🔄 {match_id}: correcting stale 'live' → '{corrected_status}' "
-                    "because 365Scores still reports scheduled"
+                    f"from explicit 365Scores status '{verify_status_text}'"
                 )
                 self.store.update_status(match_id, corrected_status)
                 forwarded = self.forwarder.forward_live_update(
@@ -527,7 +546,7 @@ class Poller:
                         "away_score": match.get("awayScore") or 0,
                         "minute": int(match.get("timeElapsed") or 0),
                         "is_live": False,
-                        "available_for_voting": True,
+                        "available_for_voting": corrected_status in ("upcoming", "soon"),
                         "minutes_to_kickoff": minutes_to_kickoff,
                     }
                 )
@@ -535,8 +554,15 @@ class Poller:
                     self._status_synced.add(match_id)
                 match["status"] = corrected_status
                 current_status = corrected_status
+                if corrected_status == "completed":
+                    self._finalize_match_result(match)
+                    return
 
-        if kickoff_passed and current_status not in ("live", "completed"):
+        if (
+            kickoff_passed
+            and current_status not in ("live", "completed")
+            and not live_status_checked
+        ):
             # CRITICAL: verify with 365Scores before forcing -- previously
             # this fired purely off kickoff_utc having passed, with no
             # check against what's actually happening in the real match,
