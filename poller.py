@@ -448,7 +448,7 @@ class Poller:
         if has_real_score and (home_score > 0 or away_score > 0):
             return True, status_text
 
-        {
+        else:
             live_markers = (
                 "1st half",
                 "2nd half",
