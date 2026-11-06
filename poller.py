@@ -470,15 +470,6 @@ class Poller:
             return True, status_text
 
         else:
-            live_markers = (
-                "1st half",
-                "2nd half",
-                "first half",
-                "second half",
-                "halftime",
-                "ht",
-                "live",
-            )
             normalized_status_text = status_text.strip().lower()
             finished_markers = ("full time", "finished", "after penalties")
             if (
