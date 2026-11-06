@@ -433,16 +433,22 @@ class Poller:
             f"score={home_score}-{away_score}"
         )
 
+        # The provider's explicit status group takes precedence over score
+        # fields. A completed match can have a non-zero final score, but that
+        # must never be mistaken for proof that it is currently live.
+        if status_group == STATUS_GROUP_FINISHED:
+            return False, "finished"
+        if status_group == STATUS_GROUP_LIVE:
+            return True, status_text
+        if status_group == STATUS_GROUP_SCHEDULED:
+            return False, "scheduled"
+
+        # Some 365Scores responses omit statusGroup. A positive, valid score
+        # is then a useful fallback signal that play has begun.
         if has_real_score and (home_score > 0 or away_score > 0):
             return True, status_text
 
-        if status_group == STATUS_GROUP_LIVE:
-            return True, status_text
-        elif status_group == STATUS_GROUP_SCHEDULED:
-            return False, "scheduled"
-        elif status_group == STATUS_GROUP_FINISHED:
-            return False, "finished"
-        else:
+        {
             live_markers = (
                 "1st half",
                 "2nd half",
