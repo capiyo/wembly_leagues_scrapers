@@ -480,14 +480,26 @@ class Poller:
                 "live",
             )
             normalized_status_text = status_text.strip().lower()
-            finished_markers = ("full time", "finished", "ft", "after penalties")
-            if any(
-                marker == normalized_status_text
-                or marker in normalized_status_text
-                for marker in finished_markers
+            finished_markers = ("full time", "finished", "after penalties")
+            if (
+                normalized_status_text == "ft"
+                or any(marker in normalized_status_text for marker in finished_markers)
             ):
                 return False, "finished"
-            if any(marker in normalized_status_text for marker in live_markers):
+            live_statuses = {
+                "1st half",
+                "2nd half",
+                "first half",
+                "second half",
+                "halftime",
+                "half time",
+                "ht",
+                "live",
+            }
+            if normalized_status_text in live_statuses or any(
+                marker in normalized_status_text
+                for marker in ("1st half", "2nd half", "first half", "second half")
+            ):
                 return True, status_text
             return False, status_text
 
