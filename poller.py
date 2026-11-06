@@ -93,7 +93,7 @@ class MatchStateMachine:
         self.settled_sub_fixture_markets = set()
 
     def determine_state(self, match: Dict[str, Any]) -> str:
-        """Determine the current state based on kickoff time."""
+        """Determine schedule state; LIVE requires source confirmation."""
         kickoff_utc = match.get("kickoffUtc")
         if not kickoff_utc:
             return match.get("status", "upcoming")
@@ -258,6 +258,7 @@ class Poller:
         self.forwarder = forwarder
         self.state_machine = MatchStateMachine(store, forwarder)
         self._status_synced = set()
+        self._live_status_verified = set()
         self.running = False
         self.poll_count = 0
         # Seeded to "already due" so the very first poll cycle after startup
@@ -495,6 +496,45 @@ class Poller:
         match["_state"] = state
 
         current_status = match.get("status", "upcoming")
+
+        # Repair stale false-LIVE records left by earlier kickoff-time
+        # heuristics. A known scheduled status from 365Scores demotes them
+        # back to SOON/UPCOMING; transient provider failures do not.
+        if current_status == "live" and match_id not in self._live_status_verified:
+            is_actually_live, verify_status_text = (
+                self._verify_live_status_with_365scores(match)
+            )
+            if is_actually_live:
+                self._live_status_verified.add(match_id)
+            elif verify_status_text == "scheduled":
+                corrected_status = (
+                    "soon"
+                    if minutes_to_kickoff is not None
+                    and minutes_to_kickoff <= SOON_THRESHOLD_MINUTES
+                    else "upcoming"
+                )
+                logger.warning(
+                    f"🔄 {match_id}: correcting stale 'live' → '{corrected_status}' "
+                    "because 365Scores still reports scheduled"
+                )
+                self.store.update_status(match_id, corrected_status)
+                forwarded = self.forwarder.forward_live_update(
+                    {
+                        "fixture_id": match_id,
+                        "event_type": "status_change",
+                        "status": corrected_status,
+                        "home_score": match.get("homeScore") or 0,
+                        "away_score": match.get("awayScore") or 0,
+                        "minute": int(match.get("timeElapsed") or 0),
+                        "is_live": False,
+                        "available_for_voting": True,
+                        "minutes_to_kickoff": minutes_to_kickoff,
+                    }
+                )
+                if forwarded:
+                    self._status_synced.add(match_id)
+                match["status"] = corrected_status
+                current_status = corrected_status
 
         if kickoff_passed and current_status not in ("live", "completed"):
             # CRITICAL: verify with 365Scores before forcing -- previously
