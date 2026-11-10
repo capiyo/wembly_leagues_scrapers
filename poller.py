@@ -808,6 +808,7 @@ class Poller:
             "captain": False,
             "lineup": lineup_slot,
             "playerId": str(player_id) if player_id is not None else None,
+            "photoUrl": member.get("photoUrl") or member.get("photo_url") or member.get("img"),
         }
 
     def _team_lineup_for_forwarder(self, team_lineup: Dict[str, Any]) -> Dict[str, Any]:
