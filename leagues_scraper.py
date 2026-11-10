@@ -76,19 +76,52 @@ logger = logging.getLogger("worldcup_poller.leagues_scraper")
 
 
 def _status_to_internal(status_text: str) -> str:
-    text = (status_text or "").strip().lower()
-    if text in ("finished", "ft", "ended", "full-time", "aet", "pen"):
+    """Map a provider status label without mistaking countdown text for play.
+
+    365Scores can include the word "live" in pre-match labels/countdowns.
+    A substring/word-boundary match therefore is not sufficient evidence
+    that the match has started. Only exact known active-phase labels (or
+    an explicit phase label followed by its provider-added clock) are live.
+    """
+    text = " ".join((status_text or "").strip().lower().split())
+
+    finished_statuses = {
+        "finished",
+        "ft",
+        "ended",
+        "full-time",
+        "full time",
+        "aet",
+        "pen",
+        "penalties",
+    }
+    if text in finished_statuses:
         return "completed"
 
-    live_patterns = (
-        r"\blive\b",
-        r"\b1st half\b",
-        r"\b2nd half\b",
-        r"\bht\b",
-        r"\bhalftime\b",
-        r"\bin progress\b",
-    )
-    if any(re.search(pattern, text) for pattern in live_patterns):
+    live_statuses = {
+        "live",
+        "1st half",
+        "2nd half",
+        "first half",
+        "second half",
+        "ht",
+        "half-time",
+        "half time",
+        "halftime",
+        "in progress",
+        "extra time",
+        "1st extra time",
+        "2nd extra time",
+        "penalty shootout",
+    }
+    if text in live_statuses:
+        return "live"
+
+    # Permit clock annotations only after a recognized phase, never after
+    # the generic word "live" (which also appears in pre-match countdowns).
+    if re.match(r"^(1st|2nd|first|second) half\b", text):
+        return "live"
+    if re.match(r"^(extra time|1st extra time|2nd extra time)\b", text):
         return "live"
 
     return "upcoming"
