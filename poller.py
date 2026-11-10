@@ -437,62 +437,72 @@ class Poller:
             return False, None
 
         game = details.get("game", {})
-        status_group = game.get("statusGroup")
-        status_text = game.get("statusText", "")
+        raw_status_group = game.get("statusGroup")
+        status_text = str(game.get("statusText") or "")
         home_score = game.get("homeCompetitor", {}).get("score")
         away_score = game.get("awayCompetitor", {}).get("score")
 
-        has_real_score = (
-            home_score is not None
-            and away_score is not None
-            and home_score >= 0
-            and away_score >= 0
-        )
+        # The API has returned numeric status groups as both JSON numbers
+        # and numeric strings. Normalize before comparing; otherwise a
+        # scheduled group such as "2" falls through to heuristic handling.
+        try:
+            status_group = int(raw_status_group) if raw_status_group is not None else None
+        except (TypeError, ValueError):
+            status_group = None
 
         logger.debug(
-            f"{match_id}: 365Scores statusGroup={status_group}, statusText='{status_text}', "
+            f"{match_id}: 365Scores statusGroup={raw_status_group!r} "
+            f"(normalized={status_group}), statusText='{status_text}', "
             f"score={home_score}-{away_score}"
         )
 
-        # The provider's explicit status group takes precedence over score
-        # fields. A completed match can have a non-zero final score, but that
-        # must never be mistaken for proof that it is currently live.
+        # A score is NOT evidence of live play: providers can publish or
+        # correct scores before/after the live phase. Only an explicit
+        # provider live status may promote a fixture to LIVE.
         if status_group == STATUS_GROUP_FINISHED:
             return False, "finished"
         if status_group == STATUS_GROUP_LIVE:
-            return True, status_text
+            return True, status_text or "live"
         if status_group == STATUS_GROUP_SCHEDULED:
             return False, "scheduled"
 
-        # Some 365Scores responses omit statusGroup. A positive, valid score
-        # is then a useful fallback signal that play has begun.
-        if has_real_score and (home_score > 0 or away_score > 0):
+        normalized_status_text = status_text.strip().lower()
+        finished_markers = (
+            "ended",
+            "full time",
+            "full-time",
+            "finished",
+            "after penalties",
+            "ft",
+            "aet",
+        )
+        if any(marker in normalized_status_text for marker in finished_markers):
+            return False, "finished"
+
+        live_statuses = {
+            "1st half",
+            "2nd half",
+            "first half",
+            "second half",
+            "halftime",
+            "half time",
+            "ht",
+            "live",
+            "extra time",
+            "1st extra time",
+            "2nd extra time",
+            "penalties",
+        }
+        if normalized_status_text in live_statuses or any(
+            marker in normalized_status_text
+            for marker in ("1st half", "2nd half", "first half", "second half", "extra time")
+        ):
             return True, status_text
 
-        else:
-            normalized_status_text = status_text.strip().lower()
-            finished_markers = ("full time", "finished", "after penalties")
-            if (
-                normalized_status_text == "ft"
-                or any(marker in normalized_status_text for marker in finished_markers)
-            ):
-                return False, "finished"
-            live_statuses = {
-                "1st half",
-                "2nd half",
-                "first half",
-                "second half",
-                "halftime",
-                "half time",
-                "ht",
-                "live",
-            }
-            if normalized_status_text in live_statuses or any(
-                marker in normalized_status_text
-                for marker in ("1st half", "2nd half", "first half", "second half")
-            ):
-                return True, status_text
-            return False, status_text
+        # Unknown or pre-match provider states stay non-live. Never use a
+        # non-zero score or kickoff timestamp as a substitute for provider
+        # confirmation.
+        return False, "scheduled" if not normalized_status_text else status_text
 
     def _process_match(self, match: Dict[str, Any]):
         match_id = match.get("matchId")
